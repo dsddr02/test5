@@ -2,7 +2,7 @@ import { connect } from "cloudflare:sockets";
 
 // Configuration
 let configUuid = "550e8400-e29b-41d4-a716-446655440000";
-let fallbackIp = "yx1.pp876.dpdns.org:8443";
+let fallbackIp = "yx1.pp876.dpdns.org";
 let fakeWebsite = "www.baidu.com";
 
 // Entry point

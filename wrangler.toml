@@ -2,3 +2,9 @@ name = "dddd"
 main = "_worker.js"
 compatibility_date = "2025-03-16"
 workers_dev = true
+# wrangler.toml (wrangler v3.88.0^)
+[observability.logs]
+enabled = true
+
+
+

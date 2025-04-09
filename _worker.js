@@ -1,262 +1,330 @@
-import { connect } from "cloudflare:sockets";
+// src/worker.js
+import { connect as establishConnection } from "cloudflare:sockets";
+let secretPhraseHash = '08f32643dbdacf81d0d511f1ee24b06de759e90f8edf742bbdc57d88';
+let gatewayAddress = "";
 
-// Configuration block
-let subscriptionPath = "sub";
-let myUUID = "550e8400-e29b-41d4-a716-446655440000";
-let defaultNodeName = "节点";
-let proxyIP = "yx1.pp876.dpdns.org";
-let fakeWebsite = "";
+if (!validateSecretPhraseHash(secretPhraseHash)) {
+    throw new Error('secretPhraseHash is not valid');
+}
 
-// Web entry point
-export default {
-  async fetch(request, env) {
-    subscriptionPath = env.SUB_PATH ?? subscriptionPath;
-    myUUID = env.SUB_UUID ?? myUUID;
-    defaultNodeName = env.SUB_NAME ?? defaultNodeName;
-    proxyIP = env.PROXY_IP ?? proxyIP;
-    fakeWebsite = env.FAKE_WEB ?? fakeWebsite;
+const serviceWorker = {
 
-    const upgradeHeader = request.headers.get("Upgrade");
-    const url = new URL(request.url);
-
-    if (!upgradeHeader || upgradeHeader !== "websocket") {
-      const encodedSubscriptionPath = encodeURIComponent(subscriptionPath);
-      switch (url.pathname) {
-        case `/${encodedSubscriptionPath}`:
-          const userAgent = request.headers.get("User-Agent")?.toLowerCase() || "";
-          const configGenerators = {
-            v2ray: v2rayConfig,
-            default: generateHintPage,
-          };
-          const tool = Object.keys(configGenerators).find((tool) => userAgent.includes(tool));
-          const generateConfig = configGenerators[tool || "default"];
-          return generateConfig(request.headers.get("Host"));
-        default:
-          if (fakeWebsite) {
-            url.hostname = fakeWebsite;
-            url.protocol = "https:";
-            const fakeRequest = new Request(url, request);
-            return fetch(fakeRequest);
-          } else {
-            return generateProjectInfoPage();
-          }
-      }
-    } else if (upgradeHeader === "websocket") {
-      return await upgradeWSRequest(request);
+    async fetch(incomingRequest, environmentVariables, context) {
+        try {
+            gatewayAddress = environmentVariables.PROXYIP || gatewayAddress;
+            secretPhraseHash = environmentVariables.SHA224PASS || secretPhraseHash;
+            const upgradeHeaderValue = incomingRequest.headers.get("Upgrade");
+            if (!upgradeHeaderValue || upgradeHeaderValue !== "websocket") {
+                const requestURL = new URL(incomingRequest.url);
+                switch (requestURL.pathname) {
+                    case "/link":
+                        const currentHost = incomingRequest.headers.get('Host');
+                        return new Response(`trojan://ca110us@${currentHost}:443/?type=ws&host=${currentHost}&security=tls`, {
+                            status: 200,
+                            headers: {
+                                "Content-Type": "text/plain;charset=utf-8",
+                            }
+                        });
+                    default:
+                        return new Response("404 Resource Not Found", { status: 404 });
+                }
+            } else {
+                return await handleTrojanOverWebSocket(incomingRequest);
+            }
+        } catch (error) {
+            let errorDetail = error;
+            return new Response(errorDetail.toString());
+        }
     }
-  },
 };
 
-// Core script architecture
-async function upgradeWSRequest(request) {
-  const webSocketPair = new WebSocketPair();
-  const [client, webSocket] = Object.values(webSocketPair);
-  webSocket.accept();
-  const secWebSocketProtocol = request.headers.get("sec-websocket-protocol");
-
-  if (!secWebSocketProtocol) {
-    return new Response("WebSocket protocol header missing", { status: 400 });
-  }
-
-  const decodedData = decodeBase64(secWebSocketProtocol);
-  const { tcpSocket, initialWriteData } = await parseVLHeader(decodedData);
-  if (!tcpSocket) {
-    return new Response("Invalid VL header or UUID", { status: 400 });
-  }
-  establishTunnel(webSocket, tcpSocket, initialWriteData);
-  return new Response(null, { status: 101, webSocket: client });
-}
-
-function decodeBase64(encodedString) {
-  const base64 = encodedString.replace(/-/g, "+").replace(/_/g, "/");
-  const decodedString = atob(base64);
-  return Uint8Array.from(decodedString, (c) => c.charCodeAt(0)).buffer;
-}
-
-async function parseVLHeader(vlData) {
-  const keyBytes = new Uint8Array(vlData.slice(1, 17));
-  if (validateVLKey(keyBytes) !== myUUID) {
-    return null;
-  }
-
-  const dataOffset = new Uint8Array(vlData)[17];
-  const portStartIndex = 18 + dataOffset + 1;
-  const portBuffer = vlData.slice(portStartIndex, portStartIndex + 2);
-  const targetPort = new DataView(portBuffer).getUint16(0);
-
-  const addressStartIndex = portStartIndex + 2;
-  const addressTypeBuffer = new Uint8Array(vlData.slice(addressStartIndex, addressStartIndex + 1));
-  const addressType = addressTypeBuffer[0];
-  let addressLength = 0;
-  let targetAddress = "";
-  let addressInfoIndex = addressStartIndex + 1;
-
-  switch (addressType) {
-    case 1: // IPv4
-      addressLength = 4;
-      targetAddress = new Uint8Array(vlData.slice(addressInfoIndex, addressInfoIndex + addressLength)).join(".");
-      break;
-    case 2: // Domain
-      addressLength = new Uint8Array(vlData.slice(addressInfoIndex, addressInfoIndex + 1))[0];
-      addressInfoIndex += 1;
-      targetAddress = new TextDecoder().decode(vlData.slice(addressInfoIndex, addressInfoIndex + addressLength));
-      break;
-    case 3: // IPv6
-      addressLength = 16;
-      const dataView = new DataView(vlData.slice(addressInfoIndex, addressInfoIndex + addressLength));
-      const ipv6 = [];
-      for (let i = 0; i < 8; i++) {
-        ipv6.push(dataView.getUint16(i * 2).toString(16));
-      }
-      targetAddress = ipv6.join(":");
-      break;
-  }
-
-  const initialWriteData = vlData.slice(addressInfoIndex + addressLength);
-
-  const [proxyHost, proxyPortStr] = proxyIP.split(":");
-  const proxyPort = Number(proxyPortStr) || 443;
-
-  try {
-    const tcpSocket = await connect({
-      hostname: proxyHost,
-      port: proxyPort,
+async function handleTrojanOverWebSocket(requestObject) {
+    const webSocketConnection = new WebSocketPair();
+    const [clientSocket, serverSocket] = Object.values(webSocketConnection);
+    serverSocket.accept();
+    let targetAddress = "";
+    let targetPortWithIdentifier = "";
+    const logEvent = (information, details) => {
+        console.log(`[${targetAddress}:${targetPortWithIdentifier}] ${information}`, details || "");
+    };
+    const earlyDataProtocol = requestObject.headers.get("sec-websocket-protocol") || "";
+    const readableClientStream = createReadableWebSocketStream(serverSocket, earlyDataProtocol, logEvent);
+    let remoteConnectionWrapper = {
+        value: null
+    };
+    let udpWriteStream = null;
+    readableClientStream.pipeTo(new WritableStream({
+        async write(dataChunk, streamController) {
+            if (udpWriteStream) {
+                return udpWriteStream(dataChunk);
+            }
+            if (remoteConnectionWrapper.value) {
+                const writer = remoteConnectionWrapper.value.writable.getWriter();
+                await writer.write(dataChunk);
+                writer.releaseLock();
+                return;
+            }
+            const {
+                hasProblem,
+                errorMessage,
+                remotePort = 443,
+                remoteHostname = "",
+                initialClientData
+            } = await parseTrojanHeaderData(dataChunk);
+            targetAddress = remoteHostname;
+            targetPortWithIdentifier = `${remotePort}--${Math.random()} tcp`;
+            if (hasProblem) {
+                throw new Error(errorMessage);
+                return;
+            }
+            manageTCPOutboundConnection(remoteConnectionWrapper, remoteHostname, remotePort, initialClientData, serverSocket, logEvent);
+        },
+        close() {
+            logEvent(`readableClientStream has closed`);
+        },
+        abort(reason) {
+            logEvent(`readableClientStream was aborted`, JSON.stringify(reason));
+        }
+    })).catch((err) => {
+        logEvent("readableClientStream pipeTo encountered an error", err);
     });
-    return { tcpSocket, initialWriteData };
-  } catch (error) {
-    console.error("Error connecting to proxy:", error);
-    return { tcpSocket: null, initialWriteData: null };
-  }
+    return new Response(null, {
+        status: 101,
+        // @ts-ignore
+        webSocket: clientSocket
+    });
 }
 
-function validateVLKey(arr, offset = 0) {
-  let uuid = "";
-  for (let i = 0; i < 16; i++) {
-    uuid += byteToHex[arr[offset + i]];
-    if ([3, 5, 7, 9].includes(i)) {
-      uuid += "-";
+async function parseTrojanHeaderData(bufferData) {
+    if (bufferData.byteLength < 56) {
+        return {
+            hasProblem: true,
+            errorMessage: "received insufficient data"
+        };
     }
-  }
-  return uuid.toLowerCase();
+    let crLfPosition = 56;
+    if (new Uint8Array(bufferData.slice(56, 57))[0] !== 0x0d || new Uint8Array(bufferData.slice(57, 58))[0] !== 0x0a) {
+        return {
+            hasProblem: true,
+            errorMessage: "invalid header format (missing CRLF)"
+        };
+    }
+    const clientPassword = new TextDecoder().decode(bufferData.slice(0, crLfPosition));
+    if (clientPassword !== secretPhraseHash) {
+        return {
+            hasProblem: true,
+            errorMessage: "incorrect password"
+        };
+    }
+
+    const socks5Payload = bufferData.slice(crLfPosition + 2);
+    if (socks5Payload.byteLength < 6) {
+        return {
+            hasProblem: true,
+            errorMessage: "invalid SOCKS5 request payload"
+        };
+    }
+
+    const dataView = new DataView(socks5Payload);
+    const command = dataView.getUint8(0);
+    if (command !== 1) {
+        return {
+            hasProblem: true,
+            errorMessage: "unsupported SOCKS5 command, only CONNECT (TCP) is permitted"
+        };
+    }
+
+    const addressType = dataView.getUint8(1);
+
+    let addressLengthValue = 0;
+    let addressStartIndex = 2;
+    let destinationAddress = "";
+    switch (addressType) {
+        case 1:
+            addressLengthValue = 4;
+            destinationAddress = new Uint8Array(
+                socks5Payload.slice(addressStartIndex, addressStartIndex + addressLengthValue)
+            ).join(".");
+            break;
+        case 3:
+            addressLengthValue = new Uint8Array(
+                socks5Payload.slice(addressStartIndex, addressStartIndex + 1)
+            )[0];
+            addressStartIndex += 1;
+            destinationAddress = new TextDecoder().decode(
+                socks5Payload.slice(addressStartIndex, addressStartIndex + addressLengthValue)
+            );
+            break;
+        case 4:
+            addressLengthValue = 16;
+            const ipv6DataView = new DataView(socks5Payload.slice(addressStartIndex, addressStartIndex + addressLengthValue));
+            const ipv6Parts = [];
+            for (let i = 0; i < 8; i++) {
+                ipv6Parts.push(ipv6DataView.getUint16(i * 2).toString(16));
+            }
+            destinationAddress = ipv6Parts.join(":");
+            break;
+        default:
+            return {
+                hasProblem: true,
+                errorMessage: `unrecognized address type: ${addressType}`
+            };
+    }
+
+    if (!destinationAddress) {
+        return {
+            hasProblem: true,
+            errorMessage: `destination address is empty, address type: ${addressType}`
+        };
+    }
+
+    const portStartIndex = addressStartIndex + addressLengthValue;
+    const portBufferData = socks5Payload.slice(portStartIndex, portStartIndex + 2);
+    const destinationPort = new DataView(portBufferData).getUint16(0);
+    return {
+        hasProblem: false,
+        remoteHostname: destinationAddress,
+        remotePort: destinationPort,
+        initialClientData: socks5Payload.slice(portStartIndex + 4)
+    };
 }
 
-const byteToHex = Array.from({ length: 256 }, (_, i) => (i < 16 ? "0" : "") + i.toString(16));
+async function manageTCPOutboundConnection(remoteEndpoint, targetHostname, targetPort, initialData, clientWebSocket, logger) {
+    async function initiateConnectionAndSend(hostname, port) {
+        const remoteTCPSocket = establishConnection({
+            hostname: hostname,
+            port: port
+        });
+        remoteEndpoint.value = remoteTCPSocket;
+        logger(`established connection to ${hostname}:${port}`);
+        const writer = remoteTCPSocket.writable.getWriter();
+        await writer.write(initialData);
+        writer.releaseLock();
+        return remoteTCPSocket;
+    }
+    async function attemptRetry() {
+        const remoteTCPSocket = await initiateConnectionAndSend(gatewayAddress || targetHostname, targetPort);
+        remoteTCPSocket.closed.catch((error) => {
+            console.log("retry tcpSocket closure error", error);
+        }).finally(() => {
+            secureCloseWebSocket(clientWebSocket);
+        });
+        pipeRemoteToWebSocket(remoteTCPSocket, clientWebSocket, null, logger);
+    }
+    const tcpSocket = await initiateConnectionAndSend(targetHostname, targetPort);
+    pipeRemoteToWebSocket(tcpSocket, clientWebSocket, attemptRetry, logger);
+}
 
-async function establishTunnel(webSocket, tcpSocket, initialWriteData) {
-  const tcpWriter = tcpSocket.writable.getWriter();
-  await webSocket.send(new Uint8Array([0, 0]).buffer);
-
-  tcpSocket.readable.pipeTo(
-    new WritableStream({
-      async write(chunk) {
-        try {
-          await webSocket.send(chunk);
-        } catch (error) {
-          console.error("Error sending data to WebSocket:", error);
-          tcpSocket.close();
+function createReadableWebSocketStream(webSocketConnection, initialProtocol, loggingFunction) {
+    let streamCancelled = false;
+    const stream = new ReadableStream({
+        start(controller) {
+            webSocketConnection.addEventListener("message", (event) => {
+                if (streamCancelled) {
+                    return;
+                }
+                const messageData = event.data;
+                controller.enqueue(messageData);
+            });
+            webSocketConnection.addEventListener("close", () => {
+                secureCloseWebSocket(webSocketConnection);
+                if (streamCancelled) {
+                    return;
+                }
+                controller.close();
+            });
+            webSocketConnection.addEventListener("error", (err) => {
+                loggingFunction("webSocketConnection encountered an error");
+                controller.error(err);
+            });
+            const { earlyData, error } = decodeBase64ToArrayBuffer(initialProtocol);
+            if (error) {
+                controller.error(error);
+            } else if (earlyData) {
+                controller.enqueue(earlyData);
+            }
+        },
+        pull(controller) {},
+        cancel(reason) {
+            if (streamCancelled) {
+                return;
+            }
+            loggingFunction(`readableStream was cancelled due to: ${reason}`);
+            streamCancelled = true;
+            secureCloseWebSocket(webSocketConnection);
         }
-      },
-      close() {
-        webSocket.close();
-      },
-      abort(reason) {
-        console.error("TCP readable stream aborted:", reason);
-        webSocket.close();
-      },
-    })
-  );
+    });
+    return stream;
+}
 
-  const webSocketStream = new ReadableStream({
-    start(controller) {
-      if (initialWriteData) {
-        controller.enqueue(initialWriteData);
-        initialWriteData = null;
-      }
-      webSocket.addEventListener("message", (event) => {
-        controller.enqueue(event.data);
-      });
-      webSocket.addEventListener("close", () => {
-        controller.close();
-        tcpSocket.close();
-      });
-      webSocket.addEventListener("error", (error) => {
-        console.error("WebSocket error:", error);
-        controller.error(error);
-        tcpSocket.close();
-      });
-    },
-  });
+async function pipeRemoteToWebSocket(remoteSocketConnection, webSocketConnection, retryFunction, loggerFunction) {
+    let receivedInitialData = false;
+    await remoteSocketConnection.readable.pipeTo(
+        new WritableStream({
+            start() {},
+            
+            async write(chunkData, controller) {
+                receivedInitialData = true;
+                if (webSocketConnection.readyState !== WEBSOCKET_OPEN_STATE) {
+                    controller.error(
+                        "webSocket connection is not currently open"
+                    );
+                }
+                webSocketConnection.send(chunkData);
+            },
+            close() {
+                loggerFunction(`remoteSocketConnection.readable has closed, receivedInitialData: ${receivedInitialData}`);
+            },
+            abort(reason) {
+                console.error("remoteSocketConnection.readable was aborted", reason);
+            }
+        })
+    ).catch((error) => {
+        console.error(
+            `pipeRemoteToWebSocket encountered an error:`,
+            error.stack || error
+        );
+        secureCloseWebSocket(webSocketConnection);
+    });
+    if (receivedInitialData === false && retryFunction) {
+        loggerFunction(`attempting retry`);
+        retryFunction();
+    }
+}
 
-  webSocketStream.pipeTo(
-    new WritableStream({
-      async write(chunk) {
-        try {
-          await tcpWriter.write(chunk);
-        } catch (error) {
-          console.error("Error writing to TCP socket:", error);
-          webSocket.close();
-          tcpSocket.close();
+function validateSecretPhraseHash(hashValue) {
+    const sha224Pattern = /^[0-9a-f]{56}$/i;
+    return sha224Pattern.test(hashValue);
+}
+
+function decodeBase64ToArrayBuffer(base64String) {
+    if (!base64String) {
+        return { error: null };
+    }
+    try {
+        base64String = base64String.replace(/-/g, "+").replace(/_/g, "/");
+        const decodedString = atob(base64String);
+        const byteArray = Uint8Array.from(decodedString, (char) => char.charCodeAt(0));
+        return { earlyData: byteArray.buffer, error: null };
+    } catch (error) {
+        return { error };
+    }
+}
+
+let WEBSOCKET_OPEN_STATE = 1;
+let WEBSOCKET_CLOSING_STATE = 2;
+
+function secureCloseWebSocket(socketObject) {
+    try {
+        if (socketObject.readyState === WEBSOCKET_OPEN_STATE || socketObject.readyState === WEBSOCKET_CLOSING_STATE) {
+            socketObject.close();
         }
-      },
-      close() {
-        tcpWriter.close();
-        tcpSocket.close();
-      },
-      abort(reason) {
-        console.error("WebSocket readable stream aborted:", reason);
-        tcpWriter.close();
-        tcpSocket.close();
-      },
-    })
-  );
+    } catch (error) {
+        console.error("secureCloseWebSocket error occurred", error);
+    }
 }
-
-function generateProjectInfoPage() {
-  const projectInfo = `
-<title>项目介绍</title>
-<style>
-  body {
-    font-size: 25px;
-  }
-</style>
-<pre>
-<strong>edge-tunnel</strong>
-
-这是一个基于CF平台的VLESS代理服务
-默认使用 ip.sb 作为代理地址
-
-vless://${myUUID}@ip.sb:443?encryption=none&security=tls&sni=your-hostname&fp=chrome&type=ws&host=your-hostname&path=/?ed=9999#默认节点
-</pre>
-`;
-
-  return new Response(projectInfo, {
-    status: 200,
-    headers: { "Content-Type": "text/html;charset=utf-8" },
-  });
-}
-
-function generateHintPage() {
-  const hintPage = `
-<title>订阅-${subscriptionPath}</title>
-<style>
-  body {
-    font-size: 25px;
-  }
-</style>
-<strong>请把链接导入v2ray客户端</strong>
-`;
-  return new Response(hintPage, {
-    status: 200,
-    headers: { "Content-Type": "text/html;charset=utf-8" },
-  });
-}
-
-function v2rayConfig(hostName) {
-  const path = encodeURIComponent("/?ed=9999");
-  const configContent = `vless://${myUUID}@${proxyIP.split(":")[0]}:443?encryption=none&security=tls&sni=${hostName}&fp=chrome&type=ws&host=${hostName}&path=${path}#${defaultNodeName}`;
-
-  return new Response(configContent, {
-    status: 200,
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-  });
-}
+export {
+    serviceWorker as
+    default
+};
+//# sourceMappingURL=worker.js.map

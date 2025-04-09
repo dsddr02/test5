@@ -59,25 +59,45 @@ async function handleTrojanOverWebSocket(requestObject) {
                 return udpWriteStream(dataChunk);
             }
             if (remoteConnectionWrapper.value) {
-                const writer = remoteConnectionWrapper.value.writable.getWriter();
-                await writer.write(dataChunk);
-                writer.releaseLock();
-                return;
+                if (remoteConnectionWrapper.type === 'tcp') {
+                    const writer = remoteConnectionWrapper.value.writable.getWriter();
+                    await writer.write(dataChunk);
+                    writer.releaseLock();
+                    return;
+                } else if (remoteConnectionWrapper.type === 'udp') {
+                    // Handle UDP data forwarding here if needed.
+                    // This part requires more context on how UDP should be handled over WebSocket.
+                    // Typically, UDP over WebSocket involves encapsulating UDP packets within WebSocket messages.
+                    // You'd need to define a specific format for this encapsulation.
+                    logEvent("Received data for UDP, but UDP handling is not fully implemented in the write stream.");
+                    return;
+                }
             }
             const {
                 hasProblem,
                 errorMessage,
                 remotePort = 443,
                 remoteHostname = "",
-                initialClientData
+                initialClientData,
+                isUdp
             } = await parseTrojanHeaderData(dataChunk);
             targetAddress = remoteHostname;
-            targetPortWithIdentifier = `${remotePort}--${Math.random()} tcp`;
+            targetPortWithIdentifier = `${remotePort}--${Math.random()} ${isUdp ? 'udp' : 'tcp'}`;
             if (hasProblem) {
                 throw new Error(errorMessage);
                 return;
             }
-            manageTCPOutboundConnection(remoteConnectionWrapper, remoteHostname, remotePort, initialClientData, serverSocket, logEvent);
+            if (isUdp) {
+                logEvent("Received UDP request, handling not fully implemented.");
+                // Implement UDP handling logic here. This might involve:
+                // 1. Establishing a UDP socket.
+                // 2. Forwarding encapsulated UDP packets.
+                // 3. Potentially using a separate mechanism for the UDP connection.
+                // For now, we'll just log that a UDP request was received.
+                streamController.error("UDP support is not fully implemented.");
+            } else {
+                manageTCPOutboundConnection(remoteConnectionWrapper, remoteHostname, remotePort, initialClientData, serverSocket, logEvent);
+            }
         },
         close() {
             logEvent(`readableClientStream has closed`);
@@ -127,15 +147,20 @@ async function parseTrojanHeaderData(bufferData) {
 
     const dataView = new DataView(socks5Payload);
     const command = dataView.getUint8(0);
-    if (command !== 1) {
+    const isUdp = command === 3; // 0x03 for UDP ASSOCIATE
+
+    if (command !== 1 && command !== 3) {
         return {
             hasProblem: true,
-            errorMessage: "unsupported SOCKS5 command, only CONNECT (TCP) is permitted"
+            errorMessage: "unsupported SOCKS5 command, only CONNECT (TCP) and UDP ASSOCIATE are permitted",
+            isUdp: false
         };
     }
 
     const addressType = dataView.getUint8(1);
-
+    // 0x01: IPv4 address
+    // 0x03: Domain name
+    // 0x04: IPv6 address
     let addressLengthValue = 0;
     let addressStartIndex = 2;
     let destinationAddress = "";
@@ -167,25 +192,32 @@ async function parseTrojanHeaderData(bufferData) {
         default:
             return {
                 hasProblem: true,
-                errorMessage: `unrecognized address type: ${addressType}`
+                errorMessage: `unrecognized address type: ${addressType}`,
+                isUdp: isUdp
             };
     }
 
     if (!destinationAddress) {
         return {
             hasProblem: true,
-            errorMessage: `destination address is empty, address type: ${addressType}`
+            errorMessage: `destination address is empty, address type: ${addressType}`,
+            isUdp: isUdp
         };
     }
 
     const portStartIndex = addressStartIndex + addressLengthValue;
     const portBufferData = socks5Payload.slice(portStartIndex, portStartIndex + 2);
     const destinationPort = new DataView(portBufferData).getUint16(0);
+
+    const initialDataStartIndex = portStartIndex + 2;
+    const initialClientData = socks5Payload.slice(initialDataStartIndex);
+
     return {
         hasProblem: false,
         remoteHostname: destinationAddress,
         remotePort: destinationPort,
-        initialClientData: socks5Payload.slice(portStartIndex + 4)
+        initialClientData: initialClientData,
+        isUdp: isUdp
     };
 }
 
@@ -196,7 +228,8 @@ async function manageTCPOutboundConnection(remoteEndpoint, targetHostname, targe
             port: port
         });
         remoteEndpoint.value = remoteTCPSocket;
-        logger(`established connection to ${hostname}:${port}`);
+        remoteEndpoint.type = 'tcp';
+        logger(`established TCP connection to ${hostname}:${port}`);
         const writer = remoteTCPSocket.writable.getWriter();
         await writer.write(initialData);
         writer.releaseLock();
@@ -209,7 +242,7 @@ async function manageTCPOutboundConnection(remoteEndpoint, targetHostname, targe
         }).finally(() => {
             secureCloseWebSocket(clientWebSocket);
         });
-        pipeRemoteToWebSocket(remoteTCPSocket, clientWebSocket, null, logger);
+        pipeRemoteToWebSocket(remoteTCPSocket, clientWebSocket, attemptRetry, logger);
     }
     const tcpSocket = await initiateConnectionAndSend(targetHostname, targetPort);
     pipeRemoteToWebSocket(tcpSocket, clientWebSocket, attemptRetry, logger);
@@ -259,10 +292,19 @@ function createReadableWebSocketStream(webSocketConnection, initialProtocol, log
 
 async function pipeRemoteToWebSocket(remoteSocketConnection, webSocketConnection, retryFunction, loggerFunction) {
     let receivedInitialData = false;
+    if (!remoteSocketConnection || !remoteSocketConnection.readable) {
+        loggerFunction("pipeRemoteToWebSocket received an invalid remote socket.");
+        secureCloseWebSocket(webSocketConnection);
+        return;
+    }
     await remoteSocketConnection.readable.pipeTo(
         new WritableStream({
             start() {},
-            
+            /**
+             *
+             * @param {Uint8Array} chunkData
+             * @param {*} controller
+             */
             async write(chunkData, controller) {
                 receivedInitialData = true;
                 if (webSocketConnection.readyState !== WEBSOCKET_OPEN_STATE) {

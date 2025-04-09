@@ -222,8 +222,8 @@ function setupStreaming(webSocket, tcpSocket, initialData) {
   const tcpWriter = tcpSocket.writable.getWriter();
   
   // 发送初始握手数据
-  webSocket.send(new Uint8Array([0, 0]).catch(console.error);
-
+  webSocket.send(new Uint8Array([0, 0])).catch(console.error);
+// 注意右括号的位置变化
   // TCP → WebSocket
   tcpSocket.readable.pipeTo(new WritableStream({
     write(chunk) {

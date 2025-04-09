@@ -54,12 +54,17 @@ async function 升级WS请求(访问请求) {
   const [客户端, WS接口] = Object.values(创建WS接口);
   WS接口.accept();
   const 读取我的加密访问内容数据头 = 访问请求.headers.get("sec-websocket-protocol");
+  
+  // Add null check for the WebSocket protocol header
+  if (!读取我的加密访问内容数据头) {
+    return new Response("WebSocket protocol header missing", { status: 400 });
+  }
+  
   const 解密数据 = 使用64位加解密(读取我的加密访问内容数据头);
   const { TCP接口, 写入初始数据 } = await 解析VL标头(解密数据);
   建立传输管道(WS接口, TCP接口, 写入初始数据);
   return new Response(null, { status: 101, webSocket: 客户端 });
 }
-
 function 使用64位加解密(还原混淆字符) {
   还原混淆字符 = 还原混淆字符.replace(/-/g, "+").replace(/_/g, "/");
   const 解密数据 = atob(还原混淆字符);

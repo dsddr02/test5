@@ -1,150 +1,182 @@
-// ====================== 配置部分 ======================
-const PROXY_PATH = '/proxy';          // WebSocket 代理路径
-const PROXY_TRIGGER = ':443';        // 触发代理的标记
-const UUID = 'YOUR-UUID-HERE';       // 替换为你的UUID
-const AUTH_KEY = 'your_password';    // 可选认证密钥
+import { connect } from "cloudflare:sockets";
 
-// ====================== WebSocket 处理 ======================
-async function handleWebSocket(request) {
-  // 认证检查（可选）
-  const url = new URL(request.url);
-  if (AUTH_KEY && url.searchParams.get('key') !== AUTH_KEY) {
-    return new Response('Forbidden', { status: 403 });
-  }
+// Configuration
+let configUuid = "550e8400-e29b-41d4-a716-446655440000";
+let fallbackIp = "yx1.pp876.dpdns.org:8443";
+let fakeWebsite = "www.baidu.com";
 
-  const [client, worker] = Object.values(new WebSocketPair());
-  
-  client.addEventListener('message', event => {
-    try {
-      // 这里可以添加解密逻辑
-      worker.send(event.data);
-    } catch (err) {
-      console.error('Client message error:', err);
-      client.close(1011, 'Error');
+// Entry point
+export default {
+  async fetch(requestObject, environment) {
+    configUuid = environment.SUB_UUID ?? configUuid;
+    fallbackIp = environment.PROXY_IP ?? fallbackIp;
+    fakeWebsite = environment.FAKE_WEB ?? fakeWebsite;
+
+    const upgradeHeader = requestObject.headers.get("Upgrade");
+    const requestUrl = new URL(requestObject.url);
+    if (!upgradeHeader || upgradeHeader !== "websocket") {
+      if (fakeWebsite) {
+        requestUrl.hostname = fakeWebsite;
+        requestUrl.protocol = "https:";
+        const proxiedRequest = new Request(requestUrl, requestObject);
+        return fetch(proxiedRequest);
+      } else {
+        return new Response("", { status: 200 }); // Return an empty response instead of the project page
+      }
+    } else if (upgradeHeader === "websocket") {
+      return await handleWebSocketUpgrade(requestObject);
     }
-  });
+  },
+};
 
-  worker.addEventListener('message', event => {
-    try {
-      // 这里可以添加加密逻辑
-      client.send(event.data);
-    } catch (err) {
-      console.error('Worker message error:', err);
-      worker.close(1011, 'Error');
-    }
-  });
+// Handles the WebSocket upgrade request
+async function handleWebSocketUpgrade(requestObject) {
+  const webSocketPair = new WebSocketPair();
+  const [clientWebSocket, workerWebSocket] = Object.values(webSocketPair);
+  workerWebSocket.accept();
 
-  client.addEventListener('close', () => worker.close());
-  worker.addEventListener('close', () => client.close());
-
-  return new Response(null, {
-    status: 101,
-    webSocket: client,
-    headers: {
-      'X-Proxy': 'Cloudflare-Worker'
-    }
-  });
+  const encryptedDataHeader = requestObject.headers.get("sec-websocket-protocol");
+  const decryptedData = base64Decode(encryptedDataHeader); // Decrypt target access data, passed to TCP handshake
+  const { tcpSocket, initialWriteData } = await parseVlessHeader(decryptedData); // Parse VLESS data and perform TCP handshake
+  establishPipeline(workerWebSocket, tcpSocket, initialWriteData);
+  return new Response(null, { status: 101, webSocket: clientWebSocket });
 }
 
-// ====================== HTTP 代理处理 ======================
-async function handleProxyRequest(request, realHost) {
-  const url = new URL(request.url);
-  
-  // 构造真实URL
-  const proxyUrl = new URL(url.pathname + url.search, `https://${realHost}`);
-  
-  // 修改请求头
-  const newHeaders = new Headers(request.headers);
-  newHeaders.set('Host', realHost);
-  newHeaders.delete('X-Forwarded-For');
-  newHeaders.set('X-Real-IP', request.headers.get('CF-Connecting-IP'));
-  
-  // 转发请求
+// Uses base64 decoding
+function base64Decode(encodedString) {
+  encodedString = encodedString.replace(/-/g, "+").replace(/_/g, "/");
+  const decodedData = atob(encodedString);
+  const decodedBuffer = Uint8Array.from(decodedData, (char) => char.charCodeAt(0));
+  return decodedBuffer.buffer;
+}
+
+// Parses the VLESS header and creates the TCP handshake
+async function parseVlessHeader(vlessData, tcpSocket) {
+  if (validateVlessKey(new Uint8Array(vlessData.slice(1, 17))) !== configUuid) {
+    return null;
+  }
+
+  const dataLocation = new Uint8Array(vlessData)[17];
+  const portIndex = 18 + dataLocation + 1;
+  const portBuffer = vlessData.slice(portIndex, portIndex + 2);
+  const targetPort = new DataView(portBuffer).getUint16(0);
+
+  const addressIndex = portIndex + 2;
+  const addressBuffer = new Uint8Array(vlessData.slice(addressIndex, addressIndex + 1));
+  const addressType = addressBuffer[0];
+
+  let addressLength = 0;
+  let targetAddress = "";
+  let addressInfoIndex = addressIndex + 1;
+
+  switch (addressType) {
+    case 1: // IPv4
+      addressLength = 4;
+      targetAddress = new Uint8Array(vlessData.slice(addressInfoIndex, addressInfoIndex + addressLength)).join(".");
+      break;
+    case 2: // Domain
+      addressLength = new Uint8Array(vlessData.slice(addressInfoIndex, addressInfoIndex + 1))[0];
+      addressInfoIndex += 1;
+      targetAddress = new TextDecoder().decode(vlessData.slice(addressInfoIndex, addressInfoIndex + addressLength));
+      break;
+    case 3: // IPv6
+      addressLength = 16;
+      const dataView = new DataView(vlessData.slice(addressInfoIndex, addressInfoIndex + addressLength));
+      const ipv6 = [];
+      for (let i = 0; i < 8; i++) {
+        ipv6.push(dataView.getUint16(i * 2).toString(16));
+      }
+      targetAddress = ipv6.join(":");
+      break;
+  }
+
+  const initialWriteData = vlessData.slice(addressInfoIndex + addressLength);
   try {
-    const response = await fetch(proxyUrl, {
-      method: request.method,
-      headers: newHeaders,
-      body: request.body,
-      redirect: 'manual'
-    });
-    
-    // 复制响应并移除敏感头
-    const responseHeaders = new Headers(response.headers);
-    responseHeaders.delete('set-cookie');
-    
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: responseHeaders
-    });
-  } catch (err) {
-    return new Response(`Proxy error: ${err.message}`, { status: 502 });
+    tcpSocket = await connect({ hostname: targetAddress, port: targetPort });
+    await tcpSocket.opened;
+  } catch {
+    if (fallbackIp) {
+      let [fallbackIpAddress, fallbackIpPort] = fallbackIp.split(":");
+      tcpSocket = await connect({
+        hostname: fallbackIpAddress,
+        port: Number(fallbackIpPort) || 443,
+      });
+    }
   }
+  return { tcpSocket, initialWriteData };
 }
 
-// ====================== 主请求处理 ======================
-async function handleRequest(request) {
-  const url = new URL(request.url);
-  
-  // WebSocket 代理 (V2RayN使用)
-  if (request.headers.get('Upgrade') === 'websocket') {
-    if (url.pathname === PROXY_PATH) {
-      return handleWebSocket(request);
-    }
-    return new Response('WebSocket endpoint not found', { status: 404 });
-  }
+// Validates the VLESS key
+function validateVlessKey(byteArray, offset = 0) {
+  const uuid = (
+    keyFormat[byteArray[offset + 0]] +
+    keyFormat[byteArray[offset + 1]] +
+    keyFormat[byteArray[offset + 2]] +
+    keyFormat[byteArray[offset + 3]] +
+    "-" +
+    keyFormat[byteArray[offset + 4]] +
+    keyFormat[byteArray[offset + 5]] +
+    "-" +
+    keyFormat[byteArray[offset + 6]] +
+    keyFormat[byteArray[offset + 7]] +
+    "-" +
+    keyFormat[byteArray[offset + 8]] +
+    keyFormat[byteArray[offset + 9]] +
+    "-" +
+    keyFormat[byteArray[offset + 10]] +
+    keyFormat[byteArray[offset + 11]] +
+    keyFormat[byteArray[offset + 12]] +
+    keyFormat[byteArray[offset + 13]] +
+    keyFormat[byteArray[offset + 14]] +
+    keyFormat[byteArray[offset + 15]]
+  ).toLowerCase();
+  return uuid;
+}
 
-  // HTTP 代理触发方式1: example.com:443
-  if (url.hostname.includes(PROXY_TRIGGER)) {
-    const realHost = url.hostname.split(PROXY_TRIGGER)[0];
-    return handleProxyRequest(request, realHost);
-  }
+const keyFormat = [];
+for (let i = 0; i < 256; ++i) {
+  keyFormat.push((i + 256).toString(16).slice(1));
+}
 
-  // HTTP 代理触发方式2: /http-proxy/example.com/path
-  if (url.pathname.startsWith('/http-proxy/')) {
-    const pathParts = url.pathname.split('/');
-    if (pathParts.length >= 3) {
-      const realHost = pathParts[2];
-      const newPath = '/' + pathParts.slice(3).join('/');
-      url.pathname = newPath;
-      return handleProxyRequest(request, realHost);
-    }
-  }
+// Creates the transmission pipeline between client WebSocket, Cloudflare, and the target
+async function establishPipeline(clientWebSocket, tcpSocket, initialWriteData) {
+  const tcpWriter = tcpSocket.writable.getWriter();
+  await clientWebSocket.send(new Uint8Array([0, 0]).buffer); // Send WS handshake authentication information to the client
 
-  // 默认响应
-  return new Response(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Cloudflare Worker Proxy</title>
-      <style>
-        body { font-family: Arial, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 20px; }
-        code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
-      </style>
-    </head>
-    <body>
-      <h1>Worker Proxy Service</h1>
-      <p><strong>WebSocket Proxy (V2RayN):</strong> <code>wss://${url.hostname}${PROXY_PATH}</code></p>
-      <p><strong>UUID:</strong> ${UUID}</p>
-      
-      <h2>HTTP Proxy Usage:</h2>
-      <h3>Format 1 (URL suffix):</h3>
-      <p><code>https://<i>target-domain</i>:443/<i>path</i></code></p>
-      <p>Example: <code>https://example.com:443/api/data</code></p>
-      
-      <h3>Format 2 (Path prefix):</h3>
-      <p><code>https://${url.hostname}/http-proxy/<i>target-domain</i>/<i>path</i></code></p>
-      <p>Example: <code>https://${url.hostname}/http-proxy/example.com/api/data</code></p>
-      
-      ${AUTH_KEY ? `<p><strong>Authentication Key:</strong> <code>?key=${AUTH_KEY}</code></p>` : ''}
-    </body>
-    </html>
-  `, {
-    headers: { 'Content-Type': 'text/html' }
+  tcpSocket.readable.pipeTo(
+    new WritableStream({
+      // Send data returned by the TCP interface back to the client via the WS interface
+      async write(vlessData) {
+        await clientWebSocket.send(vlessData);
+      },
+    })
+  );
+
+  const dataStream = new ReadableStream({
+    // Listen for WS interface data and send it to the data stream
+    async start(controller) {
+      if (initialWriteData) {
+        controller.enqueue(initialWriteData);
+        initialWriteData = null;
+      }
+      clientWebSocket.addEventListener("message", (event) => {
+        controller.enqueue(event.data);
+      }); // Listen for client WS interface messages and push them to the data stream
+      clientWebSocket.addEventListener("close", () => {
+        controller.close();
+      }); // Listen for client WS interface close information and end the stream transmission
+      clientWebSocket.addEventListener("error", () => {
+        controller.close();
+      }); // Listen for client WS interface error information and end the stream transmission
+    },
   });
-}
 
-// ====================== Worker 入口 ======================
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request));
-});
+  dataStream.pipeTo(
+    new WritableStream({
+      // Send WS data received from the client to the TCP interface
+      async write(vlessData) {
+        await tcpWriter.write(vlessData);
+      },
+    })
+  );
+}

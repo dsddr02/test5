@@ -2,181 +2,264 @@ import { connect } from "cloudflare:sockets";
 
 // Configuration
 let configUuid = "550e8400-e29b-41d4-a716-446655440000";
-let fallbackIp = "yx1.pp876.dpdns.org";
+let fallbackIp = "ts.hpc.tw";
 let fakeWebsite = "www.baidu.com";
 
 // Entry point
 export default {
-  async fetch(requestObject, environment) {
-    configUuid = environment.SUB_UUID ?? configUuid;
-    fallbackIp = environment.PROXY_IP ?? fallbackIp;
-    fakeWebsite = environment.FAKE_WEB ?? fakeWebsite;
+  async fetch(request, env) {
+    // Apply environment variables
+    configUuid = env.SUB_UUID || configUuid;
+    fallbackIp = env.PROXY_IP || fallbackIp;
+    fakeWebsite = env.FAKE_WEB || fakeWebsite;
 
-    const upgradeHeader = requestObject.headers.get("Upgrade");
-    const requestUrl = new URL(requestObject.url);
-    if (!upgradeHeader || upgradeHeader !== "websocket") {
-      if (fakeWebsite) {
-        requestUrl.hostname = fakeWebsite;
-        requestUrl.protocol = "https:";
-        const proxiedRequest = new Request(requestUrl, requestObject);
-        return fetch(proxiedRequest);
-      } else {
-        return new Response("", { status: 200 }); // Return an empty response instead of the project page
+    try {
+      const upgradeHeader = request.headers.get("Upgrade");
+      const url = new URL(request.url);
+
+      // Handle non-WebSocket requests
+      if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
+        if (fakeWebsite) {
+          url.hostname = fakeWebsite;
+          url.protocol = "https:";
+          const proxiedRequest = new Request(url, request);
+          return fetch(proxiedRequest);
+        }
+        return new Response("", { status: 200 });
       }
-    } else if (upgradeHeader === "websocket") {
-      return await handleWebSocketUpgrade(requestObject);
+
+      // Handle WebSocket upgrade
+      return await handleWebSocketUpgrade(request);
+    } catch (error) {
+      console.error("Error processing request:", error);
+      return new Response("Internal Server Error", { status: 500 });
     }
   },
 };
 
 // Handles the WebSocket upgrade request
-async function handleWebSocketUpgrade(requestObject) {
+async function handleWebSocketUpgrade(request) {
   const webSocketPair = new WebSocketPair();
-  const [clientWebSocket, workerWebSocket] = Object.values(webSocketPair);
-  workerWebSocket.accept();
+  const [client, server] = Object.values(webSocketPair);
+  server.accept();
 
-  const encryptedDataHeader = requestObject.headers.get("sec-websocket-protocol");
-  const decryptedData = base64Decode(encryptedDataHeader); // Decrypt target access data, passed to TCP handshake
-  const { tcpSocket, initialWriteData } = await parseVlessHeader(decryptedData); // Parse VLESS data and perform TCP handshake
-  establishPipeline(workerWebSocket, tcpSocket, initialWriteData);
-  return new Response(null, { status: 101, webSocket: clientWebSocket });
+  try {
+    // Verify required headers
+    const protocolHeader = request.headers.get("sec-websocket-protocol");
+    if (!protocolHeader) {
+      throw new Error("Missing Sec-WebSocket-Protocol header");
+    }
+
+    // Decode and parse VLESS data
+    const decryptedData = base64Decode(protocolHeader);
+    const { tcpSocket, initialWriteData } = await parseVlessHeader(decryptedData);
+    
+    // Establish proxying pipeline
+    establishPipeline(server, tcpSocket, initialWriteData);
+    return new Response(null, { 
+      status: 101, 
+      webSocket: client,
+      headers: {
+        "Sec-WebSocket-Protocol": protocolHeader
+      }
+    });
+  } catch (error) {
+    console.error("WebSocket upgrade failed:", error);
+    server.close(1011, error.message);
+    return new Response(`WebSocket Error: ${error.message}`, { status: 400 });
+  }
 }
 
-// Uses base64 decoding
+// Base64 decoding with validation
 function base64Decode(encodedString) {
-  encodedString = encodedString.replace(/-/g, "+").replace(/_/g, "/");
-  const decodedData = atob(encodedString);
-  const decodedBuffer = Uint8Array.from(decodedData, (char) => char.charCodeAt(0));
-  return decodedBuffer.buffer;
-}
-
-// Parses the VLESS header and creates the TCP handshake
-async function parseVlessHeader(vlessData, tcpSocket) {
-  if (validateVlessKey(new Uint8Array(vlessData.slice(1, 17))) !== configUuid) {
-    return null;
+  if (!encodedString) {
+    throw new Error("Empty encoded string");
   }
 
-  const dataLocation = new Uint8Array(vlessData)[17];
-  const portIndex = 18 + dataLocation + 1;
-  const portBuffer = vlessData.slice(portIndex, portIndex + 2);
-  const targetPort = new DataView(portBuffer).getUint16(0);
+  try {
+    // URL-safe base64 conversion
+    const sanitized = encodedString
+      .replace(/-/g, "+")
+      .replace(/_/g, "/")
+      .replace(/\s/g, "");
+    
+    // Add padding if needed
+    const padLength = 4 - (sanitized.length % 4);
+    const padded = padLength < 4 ? sanitized + "=".repeat(padLength) : sanitized;
+    
+    const decoded = atob(padded);
+    return Uint8Array.from(decoded, (c) => c.charCodeAt(0)).buffer;
+  } catch (error) {
+    throw new Error(`Base64 decode failed: ${error.message}`);
+  }
+}
 
-  const addressIndex = portIndex + 2;
-  const addressBuffer = new Uint8Array(vlessData.slice(addressIndex, addressIndex + 1));
-  const addressType = addressBuffer[0];
+// Parses VLESS header and establishes TCP connection
+async function parseVlessHeader(vlessData) {
+  if (!vlessData || vlessData.byteLength < 18) {
+    throw new Error("Invalid VLESS data");
+  }
 
+  const view = new DataView(vlessData);
+  const uuidBytes = new Uint8Array(vlessData.slice(1, 17));
+  
+  // Validate UUID
+  if (validateVlessKey(uuidBytes) !== configUuid) {
+    throw new Error("UUID authentication failed");
+  }
+
+  const addressType = view.getUint8(17);
   let addressLength = 0;
+  let addressIndex = 18;
   let targetAddress = "";
-  let addressInfoIndex = addressIndex + 1;
 
+  // Parse address
   switch (addressType) {
     case 1: // IPv4
       addressLength = 4;
-      targetAddress = new Uint8Array(vlessData.slice(addressInfoIndex, addressInfoIndex + addressLength)).join(".");
+      targetAddress = new Uint8Array(vlessData.slice(addressIndex, addressIndex + 4)).join(".");
       break;
     case 2: // Domain
-      addressLength = new Uint8Array(vlessData.slice(addressInfoIndex, addressInfoIndex + 1))[0];
-      addressInfoIndex += 1;
-      targetAddress = new TextDecoder().decode(vlessData.slice(addressInfoIndex, addressInfoIndex + addressLength));
+      addressLength = view.getUint8(addressIndex);
+      addressIndex += 1;
+      targetAddress = new TextDecoder().decode(
+        vlessData.slice(addressIndex, addressIndex + addressLength)
+      );
       break;
     case 3: // IPv6
       addressLength = 16;
-      const dataView = new DataView(vlessData.slice(addressInfoIndex, addressInfoIndex + addressLength));
-      const ipv6 = [];
+      const ipv6Parts = [];
       for (let i = 0; i < 8; i++) {
-        ipv6.push(dataView.getUint16(i * 2).toString(16));
+        ipv6Parts.push(view.getUint16(addressIndex + i * 2).toString(16));
       }
-      targetAddress = ipv6.join(":");
+      targetAddress = ipv6Parts.join(":");
       break;
+    default:
+      throw new Error(`Unsupported address type: ${addressType}`);
   }
 
-  const initialWriteData = vlessData.slice(addressInfoIndex + addressLength);
+  // Parse port
+  const portIndex = addressIndex + addressLength;
+  const targetPort = view.getUint16(portIndex);
+
+  // Remaining data
+  const initialWriteData = vlessData.slice(portIndex + 2);
+
+  // Establish TCP connection
   try {
-    tcpSocket = await connect({ hostname: targetAddress, port: targetPort });
+    const tcpSocket = await connect({
+      hostname: targetAddress,
+      port: targetPort,
+    });
     await tcpSocket.opened;
-  } catch {
-    if (fallbackIp) {
-      let [fallbackIpAddress, fallbackIpPort] = fallbackIp.split(":");
-      tcpSocket = await connect({
-        hostname: fallbackIpAddress,
-        port: Number(fallbackIpPort) || 443,
+    return { tcpSocket, initialWriteData };
+  } catch (primaryError) {
+    console.error("Primary connection failed:", primaryError);
+    
+    if (!fallbackIp) throw primaryError;
+    
+    try {
+      const [host, port] = fallbackIp.includes(":") 
+        ? fallbackIp.split(":") 
+        : [fallbackIp, 443];
+      
+      const tcpSocket = await connect({
+        hostname: host,
+        port: Number(port) || 443,
       });
+      await tcpSocket.opened;
+      return { tcpSocket, initialWriteData };
+    } catch (fallbackError) {
+      console.error("Fallback connection failed:", fallbackError);
+      throw new Error(`All connection attempts failed. Last error: ${fallbackError.message}`);
     }
   }
-  return { tcpSocket, initialWriteData };
 }
 
-// Validates the VLESS key
-function validateVlessKey(byteArray, offset = 0) {
-  const uuid = (
-    keyFormat[byteArray[offset + 0]] +
-    keyFormat[byteArray[offset + 1]] +
-    keyFormat[byteArray[offset + 2]] +
-    keyFormat[byteArray[offset + 3]] +
-    "-" +
-    keyFormat[byteArray[offset + 4]] +
-    keyFormat[byteArray[offset + 5]] +
-    "-" +
-    keyFormat[byteArray[offset + 6]] +
-    keyFormat[byteArray[offset + 7]] +
-    "-" +
-    keyFormat[byteArray[offset + 8]] +
-    keyFormat[byteArray[offset + 9]] +
-    "-" +
-    keyFormat[byteArray[offset + 10]] +
-    keyFormat[byteArray[offset + 11]] +
-    keyFormat[byteArray[offset + 12]] +
-    keyFormat[byteArray[offset + 13]] +
-    keyFormat[byteArray[offset + 14]] +
-    keyFormat[byteArray[offset + 15]]
-  ).toLowerCase();
-  return uuid;
-}
-
-const keyFormat = [];
-for (let i = 0; i < 256; ++i) {
-  keyFormat.push((i + 256).toString(16).slice(1));
-}
-
-// Creates the transmission pipeline between client WebSocket, Cloudflare, and the target
-async function establishPipeline(clientWebSocket, tcpSocket, initialWriteData) {
-  const tcpWriter = tcpSocket.writable.getWriter();
-  await clientWebSocket.send(new Uint8Array([0, 0]).buffer); // Send WS handshake authentication information to the client
-
-  tcpSocket.readable.pipeTo(
-    new WritableStream({
-      // Send data returned by the TCP interface back to the client via the WS interface
-      async write(vlessData) {
-        await clientWebSocket.send(vlessData);
-      },
-    })
+// UUID validation helper
+function validateVlessKey(bytes) {
+  if (!bytes || bytes.length !== 16) return "";
+  
+  const keyFormat = Array.from({ length: 256 }, (_, i) => 
+    (i + 256).toString(16).slice(1)
   );
+  
+  return [
+    keyFormat[bytes[0]], keyFormat[bytes[1]], 
+    keyFormat[bytes[2]], keyFormat[bytes[3]], "-",
+    keyFormat[bytes[4]], keyFormat[bytes[5]], "-",
+    keyFormat[bytes[6]], keyFormat[bytes[7]], "-",
+    keyFormat[bytes[8]], keyFormat[bytes[9]], "-",
+    keyFormat[bytes[10]], keyFormat[bytes[11]], 
+    keyFormat[bytes[12]], keyFormat[bytes[13]], 
+    keyFormat[bytes[14]], keyFormat[bytes[15]]
+  ].join("").toLowerCase();
+}
 
-  const dataStream = new ReadableStream({
-    // Listen for WS interface data and send it to the data stream
-    async start(controller) {
-      if (initialWriteData) {
-        controller.enqueue(initialWriteData);
-        initialWriteData = null;
+// Creates data pipeline between WebSocket and TCP
+async function establishPipeline(webSocket, tcpSocket, initialData) {
+  const tcpWriter = tcpSocket.writable.getWriter();
+  
+  // Send handshake confirmation
+  await webSocket.send(new Uint8Array([0, 0]).buffer);
+
+  // TCP → WebSocket
+  tcpSocket.readable.pipeTo(new WritableStream({
+    async write(chunk) {
+      try {
+        await webSocket.send(chunk);
+      } catch (error) {
+        console.error("TCP→WS write error:", error);
+        tcpWriter.abort(error);
       }
-      clientWebSocket.addEventListener("message", (event) => {
-        controller.enqueue(event.data);
-      }); // Listen for client WS interface messages and push them to the data stream
-      clientWebSocket.addEventListener("close", () => {
-        controller.close();
-      }); // Listen for client WS interface close information and end the stream transmission
-      clientWebSocket.addEventListener("error", () => {
-        controller.close();
-      }); // Listen for client WS interface error information and end the stream transmission
     },
+    close() {
+      console.log("TCP→WS stream closed");
+      webSocket.close(1000);
+    },
+    abort(error) {
+      console.error("TCP→WS stream aborted:", error);
+      webSocket.close(1011, error.message);
+    }
+  }));
+
+  // WebSocket → TCP
+  const wsStream = new ReadableStream({
+    start(controller) {
+      if (initialData) {
+        controller.enqueue(initialData);
+      }
+      
+      webSocket.addEventListener("message", (event) => {
+        controller.enqueue(event.data);
+      });
+      
+      webSocket.addEventListener("close", () => {
+        controller.close();
+        tcpWriter.close().catch(console.error);
+      });
+      
+      webSocket.addEventListener("error", (error) => {
+        controller.error(error);
+        tcpWriter.abort(error).catch(console.error);
+      });
+    }
   });
 
-  dataStream.pipeTo(
-    new WritableStream({
-      // Send WS data received from the client to the TCP interface
-      async write(vlessData) {
-        await tcpWriter.write(vlessData);
-      },
-    })
-  );
+  wsStream.pipeTo(new WritableStream({
+    async write(chunk) {
+      try {
+        await tcpWriter.write(chunk);
+      } catch (error) {
+        console.error("WS→TCP write error:", error);
+        webSocket.close(1011, error.message);
+      }
+    },
+    close() {
+      tcpWriter.close().catch(console.error);
+    },
+    abort(error) {
+      tcpWriter.abort(error).catch(console.error);
+    }
+  }));
 }

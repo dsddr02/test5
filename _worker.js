@@ -1,349 +1,230 @@
 import { connect } from "cloudflare:sockets";
 
-// 配置默认值
-const DEFAULT_CONFIG = {
-  uuid: "550e8400-e29b-41d4-a716-446655440000",
-  fallbackIp: "ts.hpc.tw:443",
-  fakeWebsite: "www.baidu.com",
-  // 新增默认协议头配置
-  defaultProtocols: [
-    "eyJ2IjoiIiwiaWQiOiI1NTBlODQwMC1lMjliLTQxZDQtYTcxNi00NDY2NTU0NDAwMDAiLCJhZGRyIjoiZHN0LmFkZHIiLCJwb3J0Ijo0NDN9" // 示例base64数据
-  ]
-};
+// Configuration block
+let 订阅路径 = "sub";
+let 我的UUID = "550e8400-e29b-41d4-a716-446655440000";
+let 默认节点名称 = "节点";
 
+let 反代IP = "ip.sb";
+
+let 伪装网页 = "";
+
+// Web entry point
 export default {
-  async fetch(request, env) {
-    const config = {
-      uuid: env.SUB_UUID || DEFAULT_CONFIG.uuid,
-      fallbackIp: env.PROXY_IP || DEFAULT_CONFIG.fallbackIp,
-      fakeWebsite: env.FAKE_WEB || DEFAULT_CONFIG.fakeWebsite,
-      defaultProtocols: env.DEFAULT_PROTOCOLS 
-        ? JSON.parse(env.DEFAULT_PROTOCOLS) 
-        : DEFAULT_CONFIG.defaultProtocols
-    };
+  async fetch(访问请求, env) {
+    订阅路径 = env.SUB_PATH ?? 订阅路径;
+    我的UUID = env.SUB_UUID ?? 我的UUID;
+    默认节点名称 = env.SUB_NAME ?? 默认节点名称;
+    反代IP = env.PROXY_IP ?? 反代IP;
+    伪装网页 = env.FAKE_WEB ?? 伪装网页;
 
-    try {
-      const url = new URL(request.url);
-      const upgradeHeader = request.headers.get("Upgrade");
-
-      // 非WebSocket请求处理
-      if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
-        if (config.fakeWebsite) {
-          url.hostname = config.fakeWebsite;
-          return fetch(new Request(url, request));
-        }
-        return new Response("", { status: 200 });
+    const 读取我的请求标头 = 访问请求.headers.get("Upgrade");
+    const url = new URL(访问请求.url);
+    if (!读取我的请求标头 || 读取我的请求标头 !== "websocket") {
+      const 最终订阅路径 = encodeURIComponent(订阅路径);
+      switch (url.pathname) {
+        case `/${最终订阅路径}`:
+          const 用户代理 = 访问请求.headers.get("User-Agent").toLowerCase();
+          const 配置生成器 = {
+            v2ray: v2ray配置文件,
+            default: 生成提示界面,
+          };
+          const 工具 = Object.keys(配置生成器).find((工具) => 用户代理.includes(工具));
+          const 生成配置 = 配置生成器[工具 || "default"];
+          return 生成配置(访问请求.headers.get("Host"));
+        default:
+          if (伪装网页) {
+            url.hostname = 伪装网页;
+            url.protocol = "https:";
+            访问请求 = new Request(url, 访问请求);
+            return fetch(访问请求);
+          } else {
+            return 生成项目介绍页面();
+          }
       }
-
-      // WebSocket升级处理
-      return await handleWebSocketUpgrade(request, config);
-    } catch (error) {
-      console.error(`Processing Error: ${error.stack}`);
-      return new Response(error.message, { status: 500 });
+    } else if (读取我的请求标头 === "websocket") {
+      return await 升级WS请求(访问请求);
     }
-  }
+  },
 };
 
-async function handleWebSocketUpgrade(request, config) {
-  const wsPair = new WebSocketPair();
-  const [client, server] = Object.values(wsPair);
-  server.accept();
-
-  try {
-    // 头部处理增强：尝试多个可能的头部字段
-    let protocolHeader = [
-      request.headers.get("Sec-WebSocket-Protocol"),
-      request.headers.get("X-Protocol"),
-      request.headers.get("Proxy-Authorization")
-    ].find(Boolean);
-
-    // 如果头部不存在，使用默认值（开发环境调试用）
-    if (!protocolHeader && config.defaultProtocols?.length > 0) {
-      console.warn("Using fallback protocol header");
-      protocolHeader = config.defaultProtocols[0];
-    }
-
-    if (!protocolHeader) {
-      throw new Error("Missing required protocol header. 需要以下任一头部: Sec-WebSocket-Protocol, X-Protocol");
-    }
-
-    // 验证协议数据
-    const vlessData = validateProtocol(protocolHeader, config.uuid);
-    const target = parseVlessAddress(vlessData);
-    
-    // 建立连接
-    const tcpSocket = await establishConnection(target, config.fallbackIp);
-    setupStreaming(server, tcpSocket, vlessData.remaining);
-    
-    return new Response(null, {
-      status: 101,
-      webSocket: client,
-      headers: {
-        "Sec-WebSocket-Protocol": protocolHeader  // 回显协议头
-      }
-    });
-  } catch (error) {
-    server.close(1008, error.message);
-    console.error(`WebSocket Error: ${error.stack}`);
-    return new Response(error.message, { status: 400 });
-  }
+// Core script architecture
+async function 升级WS请求(访问请求) {
+  const 创建WS接口 = new WebSocketPair();
+  const [客户端, WS接口] = Object.values(创建WS接口);
+  WS接口.accept();
+  const 读取我的加密访问内容数据头 = 访问请求.headers.get("sec-websocket-protocol");
+  const 解密数据 = 使用64位加解密(读取我的加密访问内容数据头);
+  const { TCP接口, 写入初始数据 } = await 解析VL标头(解密数据);
+  建立传输管道(WS接口, TCP接口, 写入初始数据);
+  return new Response(null, { status: 101, webSocket: 客户端 });
 }
 
-// 协议验证增强版
-// 增强版协议验证
-function validateProtocol(header, expectedUuid) {
-  try {
-    // 调试日志
-    console.log("Received protocol header:", header);
-    
-    // 解码Base64
-    let buffer;
-    try {
-      buffer = base64Decode(header);
-    } catch (e) {
-      throw new Error(`Base64解码失败: ${e.message}`);
-    }
-
-    // 调试解码后数据
-    console.log("Decoded data length:", buffer.byteLength);
-    if (buffer.byteLength > 0) {
-      console.log("First 3 bytes:", 
-        new Uint8Array(buffer.slice(0, 3)).join(','));
-    }
-
-    // 验证最小长度
-    const MIN_VLESS_LENGTH = 18;
-    if (buffer.byteLength < MIN_VLESS_LENGTH) {
-      throw new Error(`数据过短 (${buffer.byteLength} < ${MIN_VLESS_LENGTH})`);
-    }
-
-    const view = new DataView(buffer);
-    
-    // 验证版本号 (必须为0x00)
-    const version = view.getUint8(0);
-    if (version !== 0) {
-      throw new Error(`无效版本号: ${version} (应为0)`);
-    }
-    
-    // 提取并验证UUID
-    const uuidBytes = new Uint8Array(buffer.slice(1, 17));
-    const receivedUuid = uuidToHex(uuidBytes);
-    if (receivedUuid !== expectedUuid.toLowerCase()) {
-      console.error("UUID不匹配:", {
-        received: receivedUuid,
-        expected: expectedUuid.toLowerCase()
-      });
-      throw new Error("UUID验证失败");
-    }
-
-    // 返回解析结果
-    return {
-      addressType: view.getUint8(17),
-      buffer: buffer,
-      offset: 18,
-      raw: new Uint8Array(buffer)
-    };
-  } catch (e) {
-    throw new Error(`协议验证失败: ${e.message}`);
-  }
+function 使用64位加解密(还原混淆字符) {
+  还原混淆字符 = 还原混淆字符.replace(/-/g, "+").replace(/_/g, "/");
+  const 解密数据 = atob(还原混淆字符);
+  const 解密 = Uint8Array.from(解密数据, (c) => c.charCodeAt(0));
+  return 解密.buffer;
 }
 
-// 增强版Base64解码
-function base64Decode(str) {
-  try {
-    // 处理URL安全的Base64
-    let sanitized = String(str)
-      .replace(/-/g, '+')
-      .replace(/_/g, '/')
-      .replace(/\s/g, '');
-    
-    // 补全padding
-    const padLength = 4 - (sanitized.length % 4);
-    if (padLength < 4) {
-      sanitized += '='.repeat(padLength);
-    }
-    
-    // 解码
-    const decoded = atob(sanitized);
-    return Uint8Array.from(decoded, c => c.charCodeAt(0)).buffer;
-  } catch (e) {
-    throw new Error(`Base64解码错误: ${e.message}`);
+async function 解析VL标头(VL数据, TCP接口) {
+  if (验证VL的密钥(new Uint8Array(VL数据.slice(1, 17))) !== 我的UUID) {
+    return null;
   }
-}
-// 地址解析增强版
-function parseVlessAddress({ addressType, buffer, offset = 0 }) {
-  const view = new DataView(buffer);
-  let addressLength = 0;
-  let addressValue = "";
-  let newOffset = offset;
-
-  switch (addressType) {
-    case 1: // IPv4
-      addressLength = 4;
-      addressValue = Array.from(new Uint8Array(buffer, newOffset, 4))
-        .join(".");
-      newOffset += 4;
+  const 获取数据定位 = new Uint8Array(VL数据)[17];
+  const 提取端口索引 = 18 + 获取数据定位 + 1;
+  const 建立端口缓存 = VL数据.slice(提取端口索引, 提取端口索引 + 2);
+  const 访问端口 = new DataView(建立端口缓存).getUint16(0);
+  const 提取地址索引 = 提取端口索引 + 2;
+  const 建立地址缓存 = new Uint8Array(VL数据.slice(提取地址索引, 提取地址索引 + 1));
+  const 识别地址类型 = 建立地址缓存[0];
+  let 地址长度 = 0;
+  let 访问地址 = "";
+  let 地址信息索引 = 提取地址索引 + 1;
+  switch (识别地址类型) {
+    case 1:
+      地址长度 = 4;
+      访问地址 = new Uint8Array(VL数据.slice(地址信息索引, 地址信息索引 + 地址长度)).join(".");
       break;
-      
-    case 2: // Domain
-      addressLength = view.getUint8(newOffset);
-      newOffset += 1;
-      addressValue = new TextDecoder()
-        .decode(new Uint8Array(buffer, newOffset, addressLength));
-      newOffset += addressLength;
+    case 2:
+      地址长度 = new Uint8Array(VL数据.slice(地址信息索引, 地址信息索引 + 1))[0];
+      地址信息索引 += 1;
+      访问地址 = new TextDecoder().decode(VL数据.slice(地址信息索引, 地址信息索引 + 地址长度));
       break;
-      
-    case 3: // IPv6
-      addressLength = 16;
-      const ipv6Parts = [];
+    case 3:
+      地址长度 = 16;
+      const dataView = new DataView(VL数据.slice(地址信息索引, 地址信息索引 + 地址长度));
+      const ipv6 = [];
       for (let i = 0; i < 8; i++) {
-        ipv6Parts.push(view.getUint16(newOffset + i * 2).toString(16));
+        ipv6.push(dataView.getUint16(i * 2).toString(16));
       }
-      addressValue = ipv6Parts.join(":");
-      newOffset += 16;
+      访问地址 = ipv6.join(":");
       break;
-      
-    default:
-      throw new Error(`Unsupported address type: ${addressType}`);
   }
-
-  // 解析端口
-  const port = view.getUint16(newOffset);
-  newOffset += 2;
-
-  return {
-    address: addressValue,
-    port: port,
-    remaining: buffer.slice(newOffset),
-    raw: new Uint8Array(buffer)
-  };
-}
-
-// 连接建立增强版
-async function establishConnection(target, fallback) {
-  const primaryOptions = {
-    hostname: target.address,
-    port: target.port,
-    allowHalfOpen: false
-  };
-
-  const connectionAttempts = [
-    { type: "primary", options: primaryOptions }
-  ];
-
-  // 添加备用连接配置
-  if (fallback) {
-    const [host, port] = fallback.includes(":") 
-      ? fallback.split(":") 
-      : [fallback, 443];
-    connectionAttempts.push({
-      type: "fallback",
-      options: {
-        hostname: host,
-        port: Number(port) || 443
-      }
-    });
-  }
-
-  // 尝试所有可用连接
-  const errors = [];
-  for (const attempt of connectionAttempts) {
-    try {
-      console.log(`Attempting ${attempt.type} connection to ${attempt.options.hostname}:${attempt.options.port}`);
-      const socket = await connect(attempt.options);
-      await socket.opened;
-      return socket;
-    } catch (error) {
-      errors.push(`${attempt.type} failed: ${error.message}`);
-      console.error(`Connection ${attempt.type} failed:`, error);
-    }
-  }
-
-  throw new Error(`All connection attempts failed:\n${errors.join("\n")}`);
-}
-
-// 流处理增强版
-function setupStreaming(webSocket, tcpSocket, initialData) {
-  const tcpWriter = tcpSocket.writable.getWriter();
+  const 写入初始数据 = VL数据.slice(地址信息索引 + 地址长度);
   
-  // 发送初始握手数据
-  webSocket.send(new Uint8Array([0, 0])).catch(console.error);
-// 注意右括号的位置变化
-  // TCP → WebSocket
-  tcpSocket.readable.pipeTo(new WritableStream({
-    write(chunk) {
-      webSocket.send(chunk).catch(err => {
-        console.error("TCP→WS write error:", err);
-        tcpWriter.abort(err).catch(() => {});
-      });
-    },
-    close() {
-      webSocket.close(1000, "TCP stream ended");
-    },
-    abort(err) {
-      console.error("TCP→WS stream aborted:", err);
-      webSocket.close(1011, err.message);
-    }
-  }));
-
-  // WebSocket → TCP
-  const wsStream = new ReadableStream({
-    start(controller) {
-      if (initialData && initialData.byteLength > 0) {
-        controller.enqueue(initialData);
-      }
-      
-      webSocket.addEventListener("message", ({ data }) => {
-        controller.enqueue(data);
-      });
-      
-      webSocket.addEventListener("close", () => {
-        controller.close();
-        tcpWriter.close().catch(() => {});
-      });
-      
-      webSocket.addEventListener("error", (err) => {
-        controller.error(err);
-        tcpWriter.abort(err).catch(() => {});
-      });
-    }
+  let [反代IP地址, 反代IP端口] = 反代IP.split(":");
+  TCP接口 = await connect({
+    hostname: 反代IP地址,
+    port: Number(反代IP端口) || 443,
   });
+  
+  return { TCP接口, 写入初始数据 };
+}
 
-  wsStream.pipeTo(new WritableStream({
-    write(chunk) {
-      return tcpWriter.write(chunk).catch(err => {
-        console.error("WS→TCP write error:", err);
-        webSocket.close(1011, err.message);
-        throw err;
+function 验证VL的密钥(arr, offset = 0) {
+  const uuid = (
+    转换密钥格式[arr[offset + 0]] +
+    转换密钥格式[arr[offset + 1]] +
+    转换密钥格式[arr[offset + 2]] +
+    转换密钥格式[arr[offset + 3]] +
+    "-" +
+    转换密钥格式[arr[offset + 4]] +
+    转换密钥格式[arr[offset + 5]] +
+    "-" +
+    转换密钥格式[arr[offset + 6]] +
+    转换密钥格式[arr[offset + 7]] +
+    "-" +
+    转换密钥格式[arr[offset + 8]] +
+    转换密钥格式[arr[offset + 9]] +
+    "-" +
+    转换密钥格式[arr[offset + 10]] +
+    转换密钥格式[arr[offset + 11]] +
+    转换密钥格式[arr[offset + 12]] +
+    转换密钥格式[arr[offset + 13]] +
+    转换密钥格式[arr[offset + 14]] +
+    转换密钥格式[arr[offset + 15]]
+  ).toLowerCase();
+  return uuid;
+}
+
+const 转换密钥格式 = [];
+for (let i = 0; i < 256; ++i) {
+  转换密钥格式.push((i + 256).toString(16).slice(1));
+}
+
+async function 建立传输管道(WS接口, TCP接口, 写入初始数据) {
+  const 传输数据 = TCP接口.writable.getWriter();
+  await WS接口.send(new Uint8Array([0, 0]).buffer);
+  TCP接口.readable.pipeTo(
+    new WritableStream({
+      async write(VL数据) {
+        await WS接口.send(VL数据);
+      },
+    })
+  );
+  const 数据流 = new ReadableStream({
+    async start(控制器) {
+      if (写入初始数据) {
+        控制器.enqueue(写入初始数据);
+        写入初始数据 = null;
+      }
+      WS接口.addEventListener("message", (event) => {
+        控制器.enqueue(event.data);
+      });
+      WS接口.addEventListener("close", () => {
+        控制器.close();
+      });
+      WS接口.addEventListener("error", () => {
+        控制器.close();
       });
     },
-    close() {
-      return tcpWriter.close().catch(console.error);
-    },
-    abort(err) {
-      tcpWriter.abort(err).catch(() => {});
-    }
-  }));
+  });
+  数据流.pipeTo(
+    new WritableStream({
+      async write(VL数据) {
+        await 传输数据.write(VL数据);
+      },
+    })
+  );
 }
 
-// 工具函数
-function base64Decode(str) {
-  const sanitized = String(str)
-    .replace(/-/g, '+')
-    .replace(/_/g, '/')
-    .padEnd(str.length + (4 - str.length % 4) % 4, '=');
-  
-  try {
-    return Uint8Array.from(atob(sanitized), c => c.charCodeAt(0)).buffer;
-  } catch (e) {
-    throw new Error(`Base64 decode failed: ${e.message}`);
+function 生成项目介绍页面() {
+  const 项目介绍 = `
+<title>项目介绍</title>
+<style>
+  body {
+    font-size: 25px;
   }
+</style>
+<pre>
+<strong>edge-tunnel</strong>
+
+这是一个基于CF平台的VLESS代理服务
+默认使用 ip.sb 作为代理地址
+
+vless://${我的UUID}@ip.sb:443?encryption=none&security=tls&sni=your-hostname&fp=chrome&type=ws&host=your-hostname&path=/?ed=9999#默认节点
+</pre>
+`;
+
+  return new Response(项目介绍, {
+    status: 200,
+    headers: { "Content-Type": "text/html;charset=utf-8" },
+  });
 }
 
-function uuidToHex(bytes) {
-  if (!bytes || bytes.length !== 16) return "";
-  return [...bytes]
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('')
-    .replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
+function 生成提示界面() {
+  const 提示界面 = `
+<title>订阅-${订阅路径}</title>
+<style>
+  body {
+    font-size: 25px;
+  }
+</style>
+<strong>请把链接导入v2ray客户端</strong>
+`;
+  return new Response(提示界面, {
+    status: 200,
+    headers: { "Content-Type": "text/html;charset=utf-8" },
+  });
+}
+
+function v2ray配置文件(hostName) {
+  const path = encodeURIComponent("/?ed=9999");
+  const 配置内容 = `vless://${我的UUID}@${反代IP.split(":")[0]}:443?encryption=none&security=tls&sni=${hostName}&fp=chrome&type=ws&host=${hostName}&path=${path}#${默认节点名称}`;
+
+  return new Response(配置内容, {
+    status: 200,
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+  });
 }

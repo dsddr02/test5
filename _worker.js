@@ -90,41 +90,86 @@ async function handleWebSocketUpgrade(request, config) {
 }
 
 // 协议验证增强版
+// 增强版协议验证
 function validateProtocol(header, expectedUuid) {
   try {
-    // 支持多种编码格式
-    const buffer = (() => {
-      try {
-        return base64Decode(header);
-      } catch {
-        // 如果不是标准base64，尝试直接解析
-        return new TextEncoder().encode(header).buffer;
-      }
-    })();
+    // 调试日志
+    console.log("Received protocol header:", header);
     
+    // 解码Base64
+    let buffer;
+    try {
+      buffer = base64Decode(header);
+    } catch (e) {
+      throw new Error(`Base64解码失败: ${e.message}`);
+    }
+
+    // 调试解码后数据
+    console.log("Decoded data length:", buffer.byteLength);
+    if (buffer.byteLength > 0) {
+      console.log("First 3 bytes:", 
+        new Uint8Array(buffer.slice(0, 3)).join(','));
+    }
+
+    // 验证最小长度
+    const MIN_VLESS_LENGTH = 18;
+    if (buffer.byteLength < MIN_VLESS_LENGTH) {
+      throw new Error(`数据过短 (${buffer.byteLength} < ${MIN_VLESS_LENGTH})`);
+    }
+
     const view = new DataView(buffer);
     
-    // 验证版本 (VLESS协议第一个字节是版本号)
-    if (view.byteLength < 18 || view.getUint8(0) !== 0) {
-      throw new Error("Invalid VLESS protocol format");
+    // 验证版本号 (必须为0x00)
+    const version = view.getUint8(0);
+    if (version !== 0) {
+      throw new Error(`无效版本号: ${version} (应为0)`);
     }
     
-    // 验证UUID
+    // 提取并验证UUID
     const uuidBytes = new Uint8Array(buffer.slice(1, 17));
-    if (uuidToHex(uuidBytes) !== expectedUuid.toLowerCase()) {
-      throw new Error("UUID authentication failed");
+    const receivedUuid = uuidToHex(uuidBytes);
+    if (receivedUuid !== expectedUuid.toLowerCase()) {
+      console.error("UUID不匹配:", {
+        received: receivedUuid,
+        expected: expectedUuid.toLowerCase()
+      });
+      throw new Error("UUID验证失败");
     }
-    
-    return parseVlessAddress({
+
+    // 返回解析结果
+    return {
       addressType: view.getUint8(17),
       buffer: buffer,
-      offset: 18
-    });
+      offset: 18,
+      raw: new Uint8Array(buffer)
+    };
   } catch (e) {
-    throw new Error(`Protocol validation failed: ${e.message}`);
+    throw new Error(`协议验证失败: ${e.message}`);
   }
 }
 
+// 增强版Base64解码
+function base64Decode(str) {
+  try {
+    // 处理URL安全的Base64
+    let sanitized = String(str)
+      .replace(/-/g, '+')
+      .replace(/_/g, '/')
+      .replace(/\s/g, '');
+    
+    // 补全padding
+    const padLength = 4 - (sanitized.length % 4);
+    if (padLength < 4) {
+      sanitized += '='.repeat(padLength);
+    }
+    
+    // 解码
+    const decoded = atob(sanitized);
+    return Uint8Array.from(decoded, c => c.charCodeAt(0)).buffer;
+  } catch (e) {
+    throw new Error(`Base64解码错误: ${e.message}`);
+  }
+}
 // 地址解析增强版
 function parseVlessAddress({ addressType, buffer, offset = 0 }) {
   const view = new DataView(buffer);

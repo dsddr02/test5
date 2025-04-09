@@ -5,7 +5,7 @@ let 订阅路径 = "sub";
 let 我的UUID = "550e8400-e29b-41d4-a716-446655440000";
 let 默认节点名称 = "节点";
 
-let 反代IP = "ip.sb";
+let 反代IP = "yx1.pp876.dpdns.org";
 
 let 伪装网页 = "";
 

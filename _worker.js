@@ -1,22 +1,22 @@
 // src/worker.js
 import { connect } from "cloudflare:sockets";
 
-// 配置管理
-const config = {
-  sha224Password: '08f32643dbdacf81d0d511f1ee24b06de759e90f8edf742bbdc57d88',
-  proxyIP: "",
-  timeout: 30000,
-  maxConnections: 100,
-  debug: false
+// Configuration settings
+const settings = {
+  hashedKey: '08f32643dbdacf81d0d511f1ee24b06de759e90f8edf742bbdc57d88',
+  serverAddress: "",
+  requestTimeout: 30000,
+  maxActiveConnections: 100,
+  enableDebug: false
 };
 
-// 连接池管理
-const connectionPool = new Map();
+// Connection manager
+const activeConnections = new Map();
 
-// 日志系统
-const logger = {
+// Logger utility
+const logUtil = {
   debug(...args) {
-    if (config.debug) console.debug(`[DEBUG][${new Date().toISOString()}]`, ...args);
+    if (settings.enableDebug) console.debug(`[DEBUG][${new Date().toISOString()}]`, ...args);
   },
   info(...args) {
     console.log(`[INFO][${new Date().toISOString()}]`, ...args);
@@ -26,62 +26,56 @@ const logger = {
   }
 };
 
-// 错误处理类
-class ProxyError extends Error {
-  constructor(message, type = 'INTERNAL') {
+// Custom error class
+class AppError extends Error {
+  constructor(message, category = 'INTERNAL') {
     super(message);
-    this.type = type;
+    this.category = category;
     this.timestamp = new Date().toISOString();
   }
 }
 
-// 主Worker逻辑
-const worker_default = {
+const mainWorker = {
   async fetch(request, env, ctx) {
     try {
-      // 初始化配置
-      initConfig(env);
+      initializeSettings(env);
       
-      const upgradeHeader = request.headers.get("Upgrade");
-      if (!upgradeHeader || upgradeHeader !== "websocket") {
+      if (request.headers.get("Upgrade") !== "websocket") {
         return handleHttpRequest(request);
       } else {
-        return await trojanOverWSHandler(request);
+        return await processWebSocketRequest(request);
       }
     } catch (err) {
-      logger.error('Main handler error:', err);
+      logUtil.error('Request processing error:', err);
       return new Response(err.toString(), { 
-        status: err.type === 'AUTH' ? 403 : 500 
+        status: err.category === 'AUTH' ? 403 : 500 
       });
     }
   }
 };
 
-// 初始化配置
-function initConfig(env) {
-  config.proxyIP = env.PROXYIP || config.proxyIP;
-  config.debug = env.DEBUG === 'true' || config.debug;
-  logger.debug('Configuration loaded:', config);
+function initializeSettings(env) {
+  settings.serverAddress = env.SERVER_ADDRESS || settings.serverAddress;
+  settings.enableDebug = env.DEBUG === 'true' || settings.enableDebug;
+  logUtil.debug('Loaded configuration:', settings);
 }
 
-// HTTP请求处理
 async function handleHttpRequest(request) {
   const url = new URL(request.url);
   switch (url.pathname) {
-    case "/link":
-      return generateTrojanLink(request);
-    case "/health":
-      return healthCheck();
+    case "/generate-link":
+      return generateProxyLink(request);
+    case "/status":
+      return checkServiceHealth();
     default:
       return new Response("404 Not found", { status: 404 });
   }
 }
 
-// 生成Trojan链接
-function generateTrojanLink(request) {
+function generateProxyLink(request) {
   const host = request.headers.get('Host');
   return new Response(
-    `trojan://${config.sha224Password}@${host}:443/?type=ws&host=${host}&security=tls`, 
+    `trojan://${settings.hashedKey}@${host}:443/?type=ws&host=${host}&security=tls`, 
     {
       status: 200,
       headers: { "Content-Type": "text/plain;charset=utf-8" }
@@ -89,13 +83,11 @@ function generateTrojanLink(request) {
   );
 }
 
-// 健康检查
-function healthCheck() {
+function checkServiceHealth() {
   return new Response(
     JSON.stringify({
-      status: 'ok',
-      connections: connectionPool.size,
-      memoryUsage: process.memoryUsage().rss
+      status: 'operational',
+      activeConnections: activeConnections.size
     }), 
     {
       headers: { 'Content-Type': 'application/json' }
@@ -103,146 +95,107 @@ function healthCheck() {
   );
 }
 
-// Trojan over WebSocket处理
-async function trojanOverWSHandler(request) {
-  const webSocketPair = new WebSocketPair();
-  const [client, webSocket] = Object.values(webSocketPair);
-  webSocket.accept();
-
-  const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
-  const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader);
-
-  let remoteSocketWrapper = { value: null };
-  let address = "";
-  let portWithRandomLog = "";
-
-  const log = (info, event) => {
-    logger.info(`[${address}:${portWithRandomLog}] ${info}`, event || "");
-  };
+async function processWebSocketRequest(request) {
+  const socketPair = new WebSocketPair();
+  const [clientSocket, serverSocket] = Object.values(socketPair);
+  serverSocket.accept();
 
   try {
-    await readableWebSocketStream.pipeTo(new WritableStream({
-      async write(chunk) {
-        if (remoteSocketWrapper.value) {
-          return writeToSocket(remoteSocketWrapper.value, chunk);
-        }
-
-        const { hasError, message, portRemote, addressRemote, rawClientData } = 
-          await parseTrojanHeader(chunk);
-        
-        if (hasError) {
-          throw new ProxyError(message, 'AUTH');
-        }
-
-        address = addressRemote;
-        portWithRandomLog = `${portRemote}--${Math.random()} tcp`;
-        
-        await handleTCPOutBound(
-          remoteSocketWrapper, 
-          addressRemote, 
-          portRemote, 
-          rawClientData, 
-          webSocket, 
-          log
-        );
-      },
-      close() { log('WebSocket stream closed'); },
-      abort(reason) { log('WebSocket stream aborted', reason); }
-    }));
+    await handleClientSocket(serverSocket, request);
   } catch (err) {
-    logger.error('WebSocket pipe error:', err);
-    safeCloseWebSocket(webSocket);
+    logUtil.error('WebSocket processing error:', err);
+    closeWebSocketSafely(serverSocket);
   }
 
-  return new Response(null, { status: 101, webSocket: client });
+  return new Response(null, { status: 101, webSocket: clientSocket });
 }
 
-// 获取或创建连接
-async function getOrCreateConnection(address, port) {
-  const key = `${address}:${port}`;
-  
-  if (connectionPool.has(key)) {
-    const conn = connectionPool.get(key);
-    if (conn.readyState === 'open') return conn;
-    connectionPool.delete(key);
-  }
+async function handleClientSocket(socket, request) {
+  const readableStream = createSocketReadableStream(socket);
 
-  if (connectionPool.size >= config.maxConnections) {
-    throw new ProxyError('Connection pool exhausted', 'CAPACITY');
-  }
+  let remoteConnection = { instance: null };
+  let remoteAddress = "";
+  let remotePort = "";
 
-  logger.debug(`Creating new connection to ${key}`);
-  const newConn = await connect({ hostname: address, port });
-  newConn.on('close', () => connectionPool.delete(key));
-  connectionPool.set(key, newConn);
-  return newConn;
+  await readableStream.pipeTo(new WritableStream({
+    async write(chunk) {
+      if (remoteConnection.instance) {
+        return sendDataToSocket(remoteConnection.instance, chunk);
+      }
+
+      const { error, message, targetPort, targetAddress, initialPayload } = await extractConnectionData(chunk);
+      if (error) {
+        throw new AppError(message, 'AUTH');
+      }
+
+      remoteAddress = targetAddress;
+      remotePort = targetPort;
+
+      await establishOutboundConnection(remoteConnection, targetAddress, targetPort, initialPayload, socket);
+    },
+    close() { logUtil.info('Client socket closed'); },
+    abort(reason) { logUtil.info('Client socket aborted', reason); }
+  }));
 }
 
-// 写入socket数据
-async function writeToSocket(socket, chunk) {
+async function establishOutboundConnection(remoteConn, address, port, payload, clientSocket) {
+  remoteConn.instance = await getOrCreateRemoteConnection(address, port);
+  logUtil.info(`Connected to ${address}:${port}`);
+  await sendDataToSocket(remoteConn.instance, payload);
+  relayDataBetweenSockets(remoteConn.instance, clientSocket);
+}
+
+async function getOrCreateRemoteConnection(address, port) {
+  const connKey = `${address}:${port}`;
+  if (activeConnections.has(connKey)) {
+    const existingConn = activeConnections.get(connKey);
+    if (existingConn.readyState === 'open') return existingConn;
+    activeConnections.delete(connKey);
+  }
+
+  if (activeConnections.size >= settings.maxActiveConnections) {
+    throw new AppError('Max connections reached', 'CAPACITY');
+  }
+
+  logUtil.debug(`Opening new connection to ${connKey}`);
+  const newConnection = await connect({ hostname: address, port });
+  newConnection.on('close', () => activeConnections.delete(connKey));
+  activeConnections.set(connKey, newConnection);
+  return newConnection;
+}
+
+async function sendDataToSocket(socket, data) {
   const writer = socket.writable.getWriter();
   try {
-    await writer.write(chunk);
+    await writer.write(data);
   } finally {
     writer.releaseLock();
   }
 }
 
-// 处理TCP出站连接
-async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, log) {
-  async function connectAndWrite(address, port) {
-    const tcpSocket = await getOrCreateConnection(address, port);
-    remoteSocket.value = tcpSocket;
-    log(`Connected to ${address}:${port}`);
-    await writeToSocket(tcpSocket, rawClientData);
-    return tcpSocket;
-  }
-
-  const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-  remoteSocketToWS(tcpSocket, webSocket, log);
-}
-
-// 远程socket转WebSocket
-async function remoteSocketToWS(remoteSocket, webSocket, log) {
+async function relayDataBetweenSockets(sourceSocket, destinationSocket) {
   try {
-    await remoteSocket.readable.pipeTo(new WritableStream({
+    await sourceSocket.readable.pipeTo(new WritableStream({
       write(chunk) {
-        if (webSocket.readyState === WS_READY_STATE_OPEN) {
-          webSocket.send(chunk);
+        if (destinationSocket.readyState === 1) {
+          destinationSocket.send(chunk);
         }
       },
-      close() { log('Remote socket closed'); },
-      abort(reason) { log('Remote socket aborted', reason); }
-    }));
-  } catch (error) {
-    logger.error('Remote to WS error:', error);
-  } finally {
-    safeCloseWebSocket(webSocket);
+      close() { logUtil.info('Remote connection closed'); },
+      abort(reason) { logUtil.info('Remote connection aborted', reason); }
+    })).catch(error => {
+      logUtil.error('Data relay failed:', error);
+      closeWebSocketSafely(destinationSocket);
+    });
+  } catch (err) {
+    logUtil.error('Relay error:', err);
   }
 }
 
-// 以下辅助函数保持不变（与原始代码相同）
-function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
-  /* 原实现保持不变 */
+function closeWebSocketSafely(socket) {
+  if (socket.readyState < 2) {
+    socket.close();
+  }
 }
 
-async function parseTrojanHeader(buffer) {
-  /* 原实现保持不变 */
-}
-
-function isValidSHA224(hash) {
-  /* 原实现保持不变 */
-}
-
-function base64ToArrayBuffer(base64Str) {
-  /* 原实现保持不变 */
-}
-
-const WS_READY_STATE_OPEN = 1;
-const WS_READY_STATE_CLOSING = 2;
-
-function safeCloseWebSocket(socket) {
-  /* 原实现保持不变 */
-}
-
-export default worker_default;
+export default mainWorker;

@@ -42,9 +42,19 @@ const mainWorker = {
       
       if (request.headers.get("Upgrade") !== "websocket") {
         return handleHttpRequest(request);
-      } else {
-        return await processWebSocketRequest(request);
       }
+      
+      const socketPair = new WebSocketPair();
+      const [clientSocket, serverSocket] = Object.values(socketPair);
+      
+      // Handle the WebSocket connection in the background
+      ctx.waitUntil(handleClientSocket(serverSocket, request)
+        .catch(err => {
+          logUtil.error('WebSocket error:', err);
+          closeWebSocketSafely(serverSocket);
+        });
+      
+      return new Response(null, { status: 101, webSocket: clientSocket });
     } catch (err) {
       logUtil.error('Request processing error:', err);
       return new Response(err.toString(), { 
@@ -82,26 +92,26 @@ function generateProxyLink(request) {
     }
   );
 }
-// 将 WebSocket 的 readable 部分转换为可读流
+
 function createSocketReadableStream(webSocket) {
   return new ReadableStream({
     start(controller) {
-      webSocket.onmessage = (event) => {
+      webSocket.addEventListener('message', (event) => {
         if (event.data) {
           controller.enqueue(event.data);
         }
-      };
+      });
 
-      webSocket.onerror = (err) => {
-        controller.error(new Error('WebSocket error: ' + err.message));
-      };
-
-      webSocket.onclose = () => {
+      webSocket.addEventListener('close', () => {
         controller.close();
-      };
+      });
+
+      webSocket.addEventListener('error', (err) => {
+        controller.error(new Error('WebSocket error: ' + err));
+      });
     },
-    cancel() {
-      webSocket.close();
+    cancel(reason) {
+      webSocket.close(1000, reason);
     }
   });
 }
@@ -118,47 +128,48 @@ function checkServiceHealth() {
   );
 }
 
-async function processWebSocketRequest(request) {
-  const socketPair = new WebSocketPair();
-  const [clientSocket, serverSocket] = Object.values(socketPair);
-  serverSocket.accept();
-
-  try {
-    await handleClientSocket(serverSocket, request);
-  } catch (err) {
-    logUtil.error('WebSocket processing error:', err);
-    closeWebSocketSafely(serverSocket);
-  }
-
-  return new Response(null, { status: 101, webSocket: clientSocket });
-}
-
 async function handleClientSocket(socket, request) {
+  socket.accept();
   const readableStream = createSocketReadableStream(socket);
 
   let remoteConnection = { instance: null };
   let remoteAddress = "";
   let remotePort = "";
 
-  await readableStream.pipeTo(new WritableStream({
-    async write(chunk) {
-      if (remoteConnection.instance) {
-        return sendDataToSocket(remoteConnection.instance, chunk);
+  try {
+    await readableStream.pipeTo(new WritableStream({
+      async write(chunk) {
+        if (remoteConnection.instance) {
+          return sendDataToSocket(remoteConnection.instance, chunk);
+        }
+
+        const { error, message, targetPort, targetAddress, initialPayload } = await extractConnectionData(chunk);
+        if (error) {
+          throw new AppError(message, 'AUTH');
+        }
+
+        remoteAddress = targetAddress;
+        remotePort = targetPort;
+
+        await establishOutboundConnection(remoteConnection, targetAddress, targetPort, initialPayload, socket);
+      },
+      close() { 
+        logUtil.info('Client socket closed');
+        if (remoteConnection.instance) {
+          remoteConnection.instance.close();
+        }
+      },
+      abort(reason) { 
+        logUtil.info('Client socket aborted', reason);
+        if (remoteConnection.instance) {
+          remoteConnection.instance.close();
+        }
       }
-
-      const { error, message, targetPort, targetAddress, initialPayload } = await extractConnectionData(chunk);
-      if (error) {
-        throw new AppError(message, 'AUTH');
-      }
-
-      remoteAddress = targetAddress;
-      remotePort = targetPort;
-
-      await establishOutboundConnection(remoteConnection, targetAddress, targetPort, initialPayload, socket);
-    },
-    close() { logUtil.info('Client socket closed'); },
-    abort(reason) { logUtil.info('Client socket aborted', reason); }
-  }));
+    }));
+  } catch (err) {
+    logUtil.error('WebSocket processing error:', err);
+    throw err;
+  }
 }
 
 async function establishOutboundConnection(remoteConn, address, port, payload, clientSocket) {
@@ -170,21 +181,34 @@ async function establishOutboundConnection(remoteConn, address, port, payload, c
 
 async function getOrCreateRemoteConnection(address, port) {
   const connKey = `${address}:${port}`;
-  if (activeConnections.has(connKey)) {
-    const existingConn = activeConnections.get(connKey);
-    if (existingConn.readyState === 'open') return existingConn;
-    activeConnections.delete(connKey);
+  
+  // Clean up any dead connections
+  for (const [key, conn] of activeConnections) {
+    if (conn.closed) {
+      activeConnections.delete(key);
+    }
   }
 
   if (activeConnections.size >= settings.maxActiveConnections) {
     throw new AppError('Max connections reached', 'CAPACITY');
   }
 
-  logUtil.debug(`Opening new connection to ${connKey}`);
-  const newConnection = await connect({ hostname: address, port });
-  newConnection.on('close', () => activeConnections.delete(connKey));
-  activeConnections.set(connKey, newConnection);
-  return newConnection;
+  try {
+    logUtil.debug(`Opening new connection to ${connKey}`);
+    const newConnection = await connect({ hostname: address, port });
+    
+    newConnection.closed = false;
+    newConnection.on('close', () => {
+      newConnection.closed = true;
+      activeConnections.delete(connKey);
+    });
+    
+    activeConnections.set(connKey, newConnection);
+    return newConnection;
+  } catch (err) {
+    logUtil.error('Connection failed:', err);
+    throw new AppError('Remote connection failed', 'CONNECTION');
+  }
 }
 
 async function sendDataToSocket(socket, data) {
@@ -204,20 +228,28 @@ async function relayDataBetweenSockets(sourceSocket, destinationSocket) {
           destinationSocket.send(chunk);
         }
       },
-      close() { logUtil.info('Remote connection closed'); },
-      abort(reason) { logUtil.info('Remote connection aborted', reason); }
-    })).catch(error => {
-      logUtil.error('Data relay failed:', error);
-      closeWebSocketSafely(destinationSocket);
-    });
+      close() { 
+        logUtil.info('Remote connection closed');
+        closeWebSocketSafely(destinationSocket);
+      },
+      abort(reason) { 
+        logUtil.info('Remote connection aborted', reason);
+        closeWebSocketSafely(destinationSocket);
+      }
+    }));
   } catch (err) {
     logUtil.error('Relay error:', err);
+    closeWebSocketSafely(destinationSocket);
   }
 }
 
 function closeWebSocketSafely(socket) {
   if (socket.readyState < 2) {
-    socket.close();
+    try {
+      socket.close();
+    } catch (err) {
+      logUtil.error('Error closing socket:', err);
+    }
   }
 }
 

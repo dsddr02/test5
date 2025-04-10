@@ -1,256 +1,131 @@
-// src/worker.js
 import { connect } from "cloudflare:sockets";
 
-// Configuration settings
-const settings = {
-  hashedKey: '08f32643dbdacf81d0d511f1ee24b06de759e90f8edf742bbdc57d88',
-  serverAddress: "",
-  requestTimeout: 30000,
-  maxActiveConnections: 100,
-  enableDebug: false
-};
-
-// Connection manager
-const activeConnections = new Map();
-
-// Logger utility
-const logUtil = {
-  debug(...args) {
-    if (settings.enableDebug) console.debug(`[DEBUG][${new Date().toISOString()}]`, ...args);
-  },
-  info(...args) {
-    console.log(`[INFO][${new Date().toISOString()}]`, ...args);
-  },
-  error(...args) {
-    console.error(`[ERROR][${new Date().toISOString()}]`, ...args);
-  }
-};
-
-// Custom error class
-class AppError extends Error {
-  constructor(message, category = 'INTERNAL') {
-    super(message);
-    this.category = category;
-    this.timestamp = new Date().toISOString();
-  }
-}
-
 const mainWorker = {
-  async fetch(request, env, ctx) {
-    try {
-      initializeSettings(env);
-      
-      if (request.headers.get("Upgrade") !== "websocket") {
-        return handleHttpRequest(request);
-      }
-      
-      const socketPair = new WebSocketPair();
-      const [clientSocket, serverSocket] = Object.values(socketPair);
-      
-      // Handle the WebSocket connection in the background
-      ctx.waitUntil(handleClientSocket(serverSocket, request)
-        .catch(err => {
-          logUtil.error('WebSocket error:', err);
-          closeWebSocketSafely(serverSocket);
-        }));
-      
-      return new Response(null, { status: 101, webSocket: clientSocket });
-    } catch (err) {
-      logUtil.error('Request processing error:', err);
-      return new Response(err.toString(), { 
-        status: err.category === 'AUTH' ? 403 : 500 
-      });
+    async handleRequest(request, environment, context) {
+        try {
+            const authToken = environment.AUTH_SECRET || '08f32643dbdacf81d0d511f1ee24b06de759e90f8edf742bbdc57d88';
+            const fallbackProxy = environment.FALLBACK_PROXY || '';
+            
+            if (!/^[0-9a-f]{56}$/i.test(authToken)) {
+                throw new Error('Invalid authentication token');
+            }
+
+            if (request.headers.get("Upgrade") === "websocket") {
+                return establishWebSocketConnection(request, authToken, fallbackProxy);
+            }
+
+            const requestUrl = new URL(request.url);
+            if (requestUrl.pathname === "/connection-info") {
+                const domain = request.headers.get('Host');
+                return new Response(`trojan://server-auth@${domain}:443/?type=ws&host=${domain}&security=tls`, {
+                    headers: {"Content-Type": "text/plain;charset=utf-8"}
+                });
+            }
+            
+            return new Response("404 Not found", { status: 404 });
+        } catch (error) {
+            return new Response(error.toString());
+        }
     }
-  }
 };
 
-function initializeSettings(env) {
-  settings.serverAddress = env.SERVER_ADDRESS || settings.serverAddress;
-  settings.enableDebug = env.DEBUG === 'true' || settings.enableDebug;
-  logUtil.debug('Loaded configuration:', settings);
-}
-
-async function handleHttpRequest(request) {
-  const url = new URL(request.url);
-  switch (url.pathname) {
-    case "/generate-link":
-      return generateProxyLink(request);
-    case "/status":
-      return checkServiceHealth();
-    default:
-      return new Response("404 Not found", { status: 404 });
-  }
-}
-
-function generateProxyLink(request) {
-  const host = request.headers.get('Host');
-  return new Response(
-    `trojan://${settings.hashedKey}@${host}:443/?type=ws&host=${host}&security=tls`, 
-    {
-      status: 200,
-      headers: { "Content-Type": "text/plain;charset=utf-8" }
-    }
-  );
-}
-
-function createSocketReadableStream(webSocket) {
-  return new ReadableStream({
-    start(controller) {
-      webSocket.addEventListener('message', (event) => {
-        if (event.data) {
-          controller.enqueue(event.data);
-        }
-      });
-
-      webSocket.addEventListener('close', () => {
-        controller.close();
-      });
-
-      webSocket.addEventListener('error', (err) => {
-        controller.error(new Error('WebSocket error: ' + err));
-      });
-    },
-    cancel(reason) {
-      webSocket.close(1000, reason);
-    }
-  });
-}
-
-function checkServiceHealth() {
-  return new Response(
-    JSON.stringify({
-      status: 'operational',
-      activeConnections: activeConnections.size
-    }), 
-    {
-      headers: { 'Content-Type': 'application/json' }
-    }
-  );
-}
-
-async function handleClientSocket(socket, request) {
-  socket.accept();
-  const readableStream = createSocketReadableStream(socket);
-
-  let remoteConnection = { instance: null };
-  let remoteAddress = "";
-  let remotePort = "";
-
-  try {
-    await readableStream.pipeTo(new WritableStream({
-      async write(chunk) {
-        if (remoteConnection.instance) {
-          return sendDataToSocket(remoteConnection.instance, chunk);
-        }
-
-        const { error, message, targetPort, targetAddress, initialPayload } = await extractConnectionData(chunk);
-        if (error) {
-          throw new AppError(message, 'AUTH');
-        }
-
-        remoteAddress = targetAddress;
-        remotePort = targetPort;
-
-        await establishOutboundConnection(remoteConnection, targetAddress, targetPort, initialPayload, socket);
-      },
-      close() { 
-        logUtil.info('Client socket closed');
-        if (remoteConnection.instance) {
-          remoteConnection.instance.close();
-        }
-      },
-      abort(reason) { 
-        logUtil.info('Client socket aborted', reason);
-        if (remoteConnection.instance) {
-          remoteConnection.instance.close();
-        }
-      }
-    }));
-  } catch (err) {
-    logUtil.error('WebSocket processing error:', err);
-    throw err;
-  }
-}
-
-async function establishOutboundConnection(remoteConn, address, port, payload, clientSocket) {
-  remoteConn.instance = await getOrCreateRemoteConnection(address, port);
-  logUtil.info(`Connected to ${address}:${port}`);
-  await sendDataToSocket(remoteConn.instance, payload);
-  relayDataBetweenSockets(remoteConn.instance, clientSocket);
-}
-
-async function getOrCreateRemoteConnection(address, port) {
-  const connKey = `${address}:${port}`;
-  
-  // Clean up any dead connections
-  for (const [key, conn] of activeConnections) {
-    if (conn.closed) {
-      activeConnections.delete(key);
-    }
-  }
-
-  if (activeConnections.size >= settings.maxActiveConnections) {
-    throw new AppError('Max connections reached', 'CAPACITY');
-  }
-
-  try {
-    logUtil.debug(`Opening new connection to ${connKey}`);
-    const newConnection = await connect({ hostname: address, port });
+async function establishWebSocketConnection(request, authToken, fallbackProxy) {
+    const [clientSide, serverSide] = Object.values(new WebSocketPair());
+    serverSide.accept();
     
-    newConnection.closed = false;
-    newConnection.on('close', () => {
-      newConnection.closed = true;
-      activeConnections.delete(connKey);
+    let destinationSocket = null;
+    const initialData = extractInitialData(request.headers.get("sec-websocket-protocol") || "");
+    
+    const dataStream = new ReadableStream({
+        start(controller) {
+            serverSide.addEventListener("message", (event) => controller.enqueue(event.data));
+            serverSide.addEventListener("close", () => controller.close());
+            serverSide.addEventListener("error", (error) => controller.error(error));
+            if (initialData) controller.enqueue(initialData);
+        },
+        cancel() { serverSide.close(); }
     });
     
-    activeConnections.set(connKey, newConnection);
-    return newConnection;
-  } catch (err) {
-    logUtil.error('Connection failed:', err);
-    throw new AppError('Remote connection failed', 'CONNECTION');
-  }
-}
-
-async function sendDataToSocket(socket, data) {
-  const writer = socket.writable.getWriter();
-  try {
-    await writer.write(data);
-  } finally {
-    writer.releaseLock();
-  }
-}
-
-async function relayDataBetweenSockets(sourceSocket, destinationSocket) {
-  try {
-    await sourceSocket.readable.pipeTo(new WritableStream({
-      write(chunk) {
-        if (destinationSocket.readyState === 1) {
-          destinationSocket.send(chunk);
+    await dataStream.pipeTo(new WritableStream({
+        async write(dataChunk) {
+            if (!destinationSocket) {
+                const { targetHost, targetPort, payload, error } = validateProtocolHeader(dataChunk, authToken);
+                if (error) throw new Error(error);
+                
+                destinationSocket = await createRemoteConnection(targetHost, targetPort, fallbackProxy, payload, serverSide);
+            } else {
+                const dataWriter = destinationSocket.writable.getWriter();
+                await dataWriter.write(dataChunk);
+                dataWriter.releaseLock();
+            }
         }
-      },
-      close() { 
-        logUtil.info('Remote connection closed');
-        closeWebSocketSafely(destinationSocket);
-      },
-      abort(reason) { 
-        logUtil.info('Remote connection aborted', reason);
-        closeWebSocketSafely(destinationSocket);
-      }
-    }));
-  } catch (err) {
-    logUtil.error('Relay error:', err);
-    closeWebSocketSafely(destinationSocket);
-  }
+    })).catch(error => console.error("Data stream error:", error));
+    
+    return new Response(null, { status: 101, webSocket: clientSide });
 }
 
-function closeWebSocketSafely(socket) {
-  if (socket.readyState < 2) {
+function extractInitialData(protocolHeader) {
     try {
-      socket.close();
-    } catch (err) {
-      logUtil.error('Error closing socket:', err);
+        return Uint8Array.from(atob(protocolHeader.replace(/-/g, "+").replace(/_/g, "/")), char => char.charCodeAt(0)).buffer;
+    } catch {
+        return null;
     }
-  }
+}
+
+async function validateProtocolHeader(dataBuffer, expectedToken) {
+    if (dataBuffer.byteLength < 56) return { error: "invalid data length" };
+    if (new Uint8Array(dataBuffer.slice(56, 58)).join() !== "13,10") return { error: "invalid header format" };
+    
+    if (new TextDecoder().decode(dataBuffer.slice(0, 56)) !== expectedToken) {
+        return { error: "authentication failed" };
+    }
+
+    const protocolData = dataBuffer.slice(58);
+    if (protocolData.byteLength < 6) return { error: "insufficient protocol data" };
+    
+    const commandType = new DataView(protocolData).getUint8(0);
+    if (commandType !== 1) return { error: "only direct connections supported" };
+
+    const addressFormat = new DataView(protocolData).getUint8(1);
+    let position = 2, hostAddress = "";
+    
+    if (addressFormat === 1) { // IPv4
+        hostAddress = Array.from(new Uint8Array(protocolData.slice(position, position + 4))).join(".");
+        position += 4;
+    } else if (addressFormat === 3) { // Domain
+        const length = new Uint8Array(protocolData.slice(position, position + 1))[0];
+        hostAddress = new TextDecoder().decode(protocolData.slice(position + 1, position + 1 + length));
+        position += 1 + length;
+    } else if (addressFormat === 4) { // IPv6
+        const rawData = new DataView(protocolData.slice(position, position + 16));
+        hostAddress = Array.from({length: 8}, (_, i) => rawData.getUint16(i * 2).toString(16)).join(":");
+        position += 16;
+    } else {
+        return { error: `unsupported address format ${addressFormat}` };
+    }
+
+    const connectionPort = new DataView(protocolData.slice(position, position + 2)).getUint16(0);
+    return { 
+        targetHost: hostAddress, 
+        targetPort: connectionPort, 
+        payload: protocolData.slice(position + 4) 
+    };
+}
+
+async function createRemoteConnection(host, port, proxy, initialPayload, webSocket) {
+    const connectionTarget = proxy || host;
+    const networkSocket = connect({ hostname: connectionTarget, port });
+    
+    const outputWriter = networkSocket.writable.getWriter();
+    await outputWriter.write(initialPayload);
+    outputWriter.releaseLock();
+    
+    networkSocket.readable.pipeTo(new WritableStream({
+        write(data) { webSocket.send(data); },
+        close() { webSocket.close(); }
+    })).catch(() => webSocket.close());
+    
+    return networkSocket;
 }
 
 export default mainWorker;

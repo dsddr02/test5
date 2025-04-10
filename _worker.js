@@ -52,7 +52,7 @@ const mainWorker = {
         .catch(err => {
           logUtil.error('WebSocket error:', err);
           closeWebSocketSafely(serverSocket);
-        });
+        }));
       
       return new Response(null, { status: 101, webSocket: clientSocket });
     } catch (err) {

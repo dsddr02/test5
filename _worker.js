@@ -82,6 +82,29 @@ function generateProxyLink(request) {
     }
   );
 }
+// 将 WebSocket 的 readable 部分转换为可读流
+function createSocketReadableStream(webSocket) {
+  return new ReadableStream({
+    start(controller) {
+      webSocket.onmessage = (event) => {
+        if (event.data) {
+          controller.enqueue(event.data);
+        }
+      };
+
+      webSocket.onerror = (err) => {
+        controller.error(new Error('WebSocket error: ' + err.message));
+      };
+
+      webSocket.onclose = () => {
+        controller.close();
+      };
+    },
+    cancel() {
+      webSocket.close();
+    }
+  });
+}
 
 function checkServiceHealth() {
   return new Response(
